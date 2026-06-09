@@ -7,6 +7,8 @@ const state = {
   statusKind: "",
   isExtracting: false,
   extractionRunId: 0,
+  activeExtractionPromise: null,
+  pendingExtractionRequest: null,
   focusPendingFieldId: "",
 };
 
@@ -14,8 +16,15 @@ const TEXT_EXTENSIONS = new Set([".txt", ".csv", ".tsv", ".json", ".md", ".markd
 const FIELD_BOUNDARY_PREFIX = "(?:\\n\\s*|[\\s,，;；]+)";
 const OCR_MAX_PDF_PAGES = 3;
 const KNOWN_PDF_FIELD_REGION_HINTS = {
-  [normalizeFieldLabel("客户名称")]: { left: 0.18, top: 0.18, width: 0.70, height: 0.07, scale: 4, threshold: 0, psm: "6" },
-  [normalizeFieldLabel("仪器名称")]: { left: 0.18, top: 0.29, width: 0.70, height: 0.06, scale: 4, threshold: 0, psm: "6" },
+  [normalizeFieldLabel("证书编号")]: { left: 0.19, top: 0.165, width: 0.16, height: 0.028, psm: "7", useThresholded: true },
+  [normalizeFieldLabel("客户名称")]: { left: 0.18, top: 0.18, width: 0.70, height: 0.07, psm: "6" },
+  [normalizeFieldLabel("地址")]: { left: 0.20, top: 0.245, width: 0.45, height: 0.06, psm: "7" },
+  [normalizeFieldLabel("仪器名称")]: { left: 0.18, top: 0.29, width: 0.70, height: 0.06, psm: "6" },
+};
+const FIELD_LABEL_ALIASES = {
+  [normalizeFieldLabel("证书编号")]: ["证书编号", "证书号", "Certificate No.", "Certificate No", "Certificate Number"],
+  [normalizeFieldLabel("客户名称")]: ["客户名称", "Client Name"],
+  [normalizeFieldLabel("地址")]: ["地址", "Address"],
 };
 const GENERIC_FIELD_SUFFIXES = [
   "号",
@@ -71,7 +80,7 @@ const resetTemplateBtn = document.getElementById("resetTemplateBtn");
 let pdfJsLibPromise;
 let ocrWorkerPromise;
 let tesseractLoadPromise;
-const STATIC_ASSET_VERSION = "20260609-ocrfix3";
+const STATIC_ASSET_VERSION = "20260609-ocrfix4";
 
 function resolveAssetUrl(relativePath, options = {}) {
   const { versioned = true } = options;
@@ -266,7 +275,7 @@ async function commitPendingField(pendingFieldId, rawValue) {
   state.fields.push(ensureUniqueFieldName(nextName));
   applyFieldsToRecords();
   render();
-  await refreshAutoExtraction(state.files, { reReadContent: false });
+  await refreshAutoExtraction(state.files, { reReadContent: true });
   return true;
 }
 
@@ -341,7 +350,7 @@ function renderFieldList() {
         return;
       }
       renderDataViews();
-      await refreshAutoExtraction(state.files, { reReadContent: false });
+      await refreshAutoExtraction(state.files, { reReadContent: true });
     });
 
     const insertBtn = document.createElement("button");
@@ -364,7 +373,7 @@ function renderFieldList() {
       });
       applyFieldsToRecords();
       render();
-      await refreshAutoExtraction(state.files, { reReadContent: false });
+      await refreshAutoExtraction(state.files, { reReadContent: true });
     });
 
     const actionRow = document.createElement("div");
@@ -698,7 +707,7 @@ async function exportZip() {
     renderDataViews();
   }
   if (state.files.length && fieldsChanged) {
-    await refreshAutoExtraction(state.files, { reReadContent: false });
+    await refreshAutoExtraction(state.files, { reReadContent: true });
   }
   const previewRows = buildPreviewRows();
   exportZipBtn.disabled = true;
@@ -772,6 +781,54 @@ function buildFlexibleFieldPattern(field) {
   return Array.from(compact).map(escapeRegExp).join("\\s*");
 }
 
+function getFieldLabelVariants(field) {
+  const normalizedField = normalizeFieldLabel(field);
+  const aliases = FIELD_LABEL_ALIASES[normalizedField] || [];
+  return [...new Set([field, ...aliases].map((item) => normalizeWhitespace(item)).filter(Boolean))];
+}
+
+function getFlexibleFieldPatterns(field) {
+  return getFieldLabelVariants(field)
+    .map(buildFlexibleFieldPattern)
+    .filter(Boolean)
+    .sort((left, right) => right.length - left.length);
+}
+
+function normalizeComparableLabel(value) {
+  return normalizeFieldLabel(String(value || "").replace(/[：:,.，。]+$/g, ""));
+}
+
+function matchesFieldLabelText(text, field) {
+  const normalizedText = normalizeComparableLabel(text);
+  if (!normalizedText) {
+    return false;
+  }
+
+  return getFieldLabelVariants(field).some((variant) => {
+    const normalizedVariant = normalizeComparableLabel(variant);
+    return normalizedVariant
+      && (normalizedText === normalizedVariant || normalizedText.includes(normalizedVariant));
+  });
+}
+
+function hasReadableContent(value) {
+  return /[A-Za-z0-9\u3400-\u9fff]/.test(value || "");
+}
+
+function compactChineseValue(value) {
+  return normalizeWhitespace(value || "")
+    .replace(/\s*（\s*/g, "（")
+    .replace(/\s*）\s*/g, "）")
+    .replace(/([\u3400-\u9fff])\s+(?=[\u3400-\u9fff0-9A-Za-z（(])/g, "$1")
+    .replace(/([0-9A-Za-z）)])\s+(?=[\u3400-\u9fff])/g, "$1");
+}
+
+function extractBestStructuredIdentifier(value) {
+  const compact = normalizeWhitespace(value || "").replace(/\s+/g, "");
+  const matches = compact.match(/[A-Za-z]?\d[\dA-Za-z._/#()（）+-]{5,}/g) || [];
+  return matches.sort((left, right) => right.length - left.length)[0] || "";
+}
+
 function stripTrailingPaginationArtifacts(value) {
   let nextValue = normalizeWhitespace(String(value || ""));
   if (!nextValue) {
@@ -802,18 +859,25 @@ function stripTrailingPaginationArtifacts(value) {
 
 function extractInlineFieldValue(text, field) {
   const source = normalizeWhitespace(text || "");
-  const fieldPattern = buildFlexibleFieldPattern(field);
-  if (!source || !fieldPattern) {
+  const fieldPatterns = getFlexibleFieldPatterns(field);
+  if (!source || !fieldPatterns.length) {
     return "";
   }
 
-  const pattern = new RegExp(`${fieldPattern}\\s*[：:]?\\s*(.+)$`, "i");
-  const match = source.match(pattern);
-  if (!match || !match[1]) {
-    return "";
+  for (const fieldPattern of fieldPatterns) {
+    const pattern = new RegExp(`${fieldPattern}\\s*[：:]?\\s*(.+)$`, "i");
+    const match = source.match(pattern);
+    if (!match || !match[1]) {
+      continue;
+    }
+
+    const candidate = normalizeFieldValueForOutput(field, stripTrailingPaginationArtifacts(match[1]));
+    if (isUsableExtractedValue(candidate, field)) {
+      return candidate;
+    }
   }
 
-  return cleanExtractedValue(stripTrailingPaginationArtifacts(match[1]));
+  return "";
 }
 
 function normalizeExtractedText(text) {
@@ -898,6 +962,11 @@ function parseTesseractTsv(tsvText) {
     .sort((a, b) => (a.top - b.top) || (a.left - b.left));
 }
 
+function findBestOcrLabelLine(lines, field) {
+  return lines.find((line) => matchesFieldLabelText(line.text, field))
+    || lines.find((line) => getFlexibleFieldPatterns(field).some((pattern) => new RegExp(pattern, "i").test(line.text)));
+}
+
 function pickBestOcrValueCandidate(labelLine, lines, field) {
   const labelCenterY = (labelLine.top + labelLine.bottom) / 2;
   const labelHeight = Math.max(labelLine.height, 12);
@@ -949,16 +1018,14 @@ function buildStructuredTextFromOcrLines(lines, fields) {
 
   const results = [];
   fields.forEach((field) => {
-    const normalizedField = normalizeFieldLabel(field);
-    const labelLine = lines.find((line) => normalizeFieldLabel(line.text) === normalizedField)
-      || lines.find((line) => normalizeFieldLabel(line.text).includes(normalizedField));
+    const labelLine = findBestOcrLabelLine(lines, field);
 
     if (!labelLine) {
       return;
     }
 
-    const value = cleanExtractedValue(pickBestOcrValueCandidate(labelLine, lines, field));
-    if (!value) {
+    const value = normalizeFieldValueForOutput(field, pickBestOcrValueCandidate(labelLine, lines, field));
+    if (!isUsableExtractedValue(value, field)) {
       return;
     }
 
@@ -1013,8 +1080,11 @@ function pickBestOcrTextLine(text) {
 }
 
 function shouldRetryOcrValue(value, field) {
-  const normalized = normalizeWhitespace(value || "");
+  const normalized = normalizeFieldValueForOutput(field, value);
   if (!normalized) {
+    return true;
+  }
+  if (!isUsableExtractedValue(normalized, field)) {
     return true;
   }
   if (normalizeFieldLabel(normalized) === normalizeFieldLabel(field)) {
@@ -1122,27 +1192,27 @@ async function buildStructuredTextFromOcrPage(canvas, rawCanvas, worker, lines, 
 
   const results = [];
   for (const field of fields) {
-    const normalizedField = normalizeFieldLabel(field);
-    const labelLine = lines.find((line) => normalizeFieldLabel(line.text) === normalizedField)
-      || lines.find((line) => normalizeFieldLabel(line.text).includes(normalizedField));
+    const labelLine = findBestOcrLabelLine(lines, field);
     const regionHint = pageNumber === 1 ? getKnownPdfFieldRegionHint(field) : null;
 
     let value = "";
     if (labelLine) {
       value = extractInlineFieldValue(labelLine.text, field);
       if (shouldRetryOcrValue(value, field)) {
-        value = cleanExtractedValue(stripTrailingPaginationArtifacts(pickBestOcrValueCandidate(labelLine, lines, field)));
+        value = normalizeFieldValueForOutput(field, stripTrailingPaginationArtifacts(pickBestOcrValueCandidate(labelLine, lines, field)));
       }
       if (shouldRetryOcrValue(value, field)) {
-        value = await extractOcrValueByCrop(canvas, worker, labelLine);
+        value = normalizeFieldValueForOutput(field, await extractOcrValueByCrop(canvas, worker, labelLine));
       }
     }
 
     if (shouldRetryOcrValue(value, field) && regionHint) {
-      value = await extractOcrValueFromRegion(rawCanvas, worker, regionHint);
+      const sourceCanvas = regionHint.useThresholded ? canvas : (rawCanvas || canvas);
+      value = normalizeFieldValueForOutput(field, await extractOcrValueFromRegion(sourceCanvas, worker, regionHint));
     }
 
-    if (value) {
+    value = normalizeFieldValueForOutput(field, value);
+    if (isUsableExtractedValue(value, field)) {
       results.push(`${field}：${value}`);
     }
   }
@@ -1265,6 +1335,49 @@ function cleanExtractedValue(value) {
     .trim());
 }
 
+function normalizeFieldValueForOutput(field, value) {
+  let nextValue = cleanExtractedValue(String(value || ""));
+  const fieldKey = normalizeFieldLabel(field);
+
+  if (fieldKey === normalizeFieldLabel("证书编号")) {
+    const identifier = extractBestStructuredIdentifier(nextValue);
+    if (identifier) {
+      return identifier;
+    }
+  }
+
+  if (fieldKey === normalizeFieldLabel("客户名称") || fieldKey === normalizeFieldLabel("地址")) {
+    nextValue = compactChineseValue(nextValue);
+  }
+
+  return nextValue;
+}
+
+function isUsableExtractedValue(value, field) {
+  const normalized = normalizeFieldValueForOutput(field, value);
+  if (!normalized) {
+    return false;
+  }
+
+  if (!normalizeWhitespace(stripTrailingPaginationArtifacts(normalized))) {
+    return false;
+  }
+
+  if (!hasReadableContent(normalized)) {
+    return false;
+  }
+
+  if (normalizeFieldLabel(normalized) === normalizeFieldLabel(field)) {
+    return false;
+  }
+
+  if (looksLikeStructuredIdentifier(normalized)) {
+    return true;
+  }
+
+  return !isLikelyOcrLabel(normalized, field);
+}
+
 function truncateAtNextField(value, currentField) {
   const boundaryIndex = findNextFieldBoundary(value, currentField);
   const sliced = boundaryIndex >= 0 ? value.slice(0, boundaryIndex) : value;
@@ -1272,30 +1385,73 @@ function truncateAtNextField(value, currentField) {
   return cleanExtractedValue(withoutPagination);
 }
 
-function extractFieldValueFromText(text, field) {
-  const fieldPattern = buildFlexibleFieldPattern(field);
-  if (!text || !fieldPattern) {
+function extractFieldValueFromLines(text, field) {
+  const lines = normalizeExtractedText(text || "")
+    .split(/\r?\n/)
+    .map((line) => normalizeWhitespace(line))
+    .filter(Boolean);
+  const fieldPatterns = getFlexibleFieldPatterns(field);
+
+  if (!lines.length || !fieldPatterns.length) {
     return "";
   }
-  const patterns = [
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (!fieldPatterns.some((pattern) => new RegExp(pattern, "i").test(line))) {
+      continue;
+    }
+
+    for (const fieldPattern of fieldPatterns) {
+      const inlinePattern = new RegExp(`${fieldPattern}\\s*[：:]?\\s*(.*)$`, "i");
+      const inlineMatch = line.match(inlinePattern);
+      if (!inlineMatch) {
+        continue;
+      }
+
+      const inlineCandidate = normalizeFieldValueForOutput(field, truncateAtNextField(inlineMatch[1], field));
+      if (isUsableExtractedValue(inlineCandidate, field)) {
+        return inlineCandidate;
+      }
+    }
+
+    for (let offset = 1; offset <= 2 && index + offset < lines.length; offset += 1) {
+      const candidate = normalizeFieldValueForOutput(field, truncateAtNextField(lines[index + offset], field));
+      if (isUsableExtractedValue(candidate, field)) {
+        return candidate;
+      }
+    }
+  }
+
+  return "";
+}
+
+function extractFieldValueFromText(text, field) {
+  const fieldPatterns = getFlexibleFieldPatterns(field);
+  if (!text || !fieldPatterns.length) {
+    return "";
+  }
+  const patterns = fieldPatterns.flatMap((fieldPattern) => ([
     new RegExp(`(?:^|[\\n\\r])\\s*${fieldPattern}\\s*[：:]\\s*([^\\n\\r]+)`, "i"),
     new RegExp(`${fieldPattern}\\s*[：:]\\s*([^\\n\\r]+)`, "i"),
     new RegExp(`(?:^|[\\n\\r])\\s*${fieldPattern}\\s+([^\\n\\r]+)`, "i"),
     new RegExp(`${fieldPattern}\\s+([^\\n\\r]+)`, "i"),
     new RegExp(`(?:^|[\\n\\r])\\s*${fieldPattern}\\s*[：:]?\\s*[\\n\\r]+\\s*([^\\n\\r]+)`, "i"),
-  ];
+  ]));
 
   for (const pattern of patterns) {
     const match = text.match(pattern);
     if (!match || !match[1]) {
       continue;
     }
-    const candidate = truncateAtNextField(match[1], field);
-    if (candidate) {
+
+    const candidate = normalizeFieldValueForOutput(field, truncateAtNextField(match[1], field));
+    if (isUsableExtractedValue(candidate, field)) {
       return candidate;
     }
   }
-  return "";
+
+  return extractFieldValueFromLines(text, field);
 }
 
 function syncValuesFromContent(record) {
@@ -1518,7 +1674,17 @@ async function populateRecordFromContent(record, options = {}) {
   }
 }
 
-async function refreshAutoExtraction(records = state.files, options = {}) {
+function mergeExtractionRequest(request, records = state.files, options = {}) {
+  const mergedRecords = [...new Set([...(request?.records || []), ...(records || [])])];
+  return {
+    records: mergedRecords,
+    options: {
+      reReadContent: Boolean(request?.options?.reReadContent || options.reReadContent),
+    },
+  };
+}
+
+async function runAutoExtraction(records = state.files, options = {}) {
   syncPendingFieldInputs();
   if (!records.length) {
     renderDataViews();
@@ -1541,6 +1707,33 @@ async function refreshAutoExtraction(records = state.files, options = {}) {
 
   state.isExtracting = false;
   renderDataViews();
+}
+
+function refreshAutoExtraction(records = state.files, options = {}) {
+  const nextRequest = mergeExtractionRequest(null, records, options);
+
+  if (state.isExtracting && state.activeExtractionPromise) {
+    state.pendingExtractionRequest = mergeExtractionRequest(state.pendingExtractionRequest, nextRequest.records, nextRequest.options);
+    return state.activeExtractionPromise;
+  }
+
+  const task = runAutoExtraction(nextRequest.records, nextRequest.options).finally(async () => {
+    if (state.activeExtractionPromise !== task) {
+      return;
+    }
+
+    state.activeExtractionPromise = null;
+    if (!state.pendingExtractionRequest) {
+      return;
+    }
+
+    const pendingRequest = state.pendingExtractionRequest;
+    state.pendingExtractionRequest = null;
+    await refreshAutoExtraction(pendingRequest.records, pendingRequest.options);
+  });
+
+  state.activeExtractionPromise = task;
+  return task;
 }
 
 fileInput.addEventListener("change", (event) => {

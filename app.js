@@ -25,9 +25,32 @@ const FIELD_LABEL_ALIASES = {
   [normalizeFieldLabel("证书编号")]: ["证书编号", "证书号", "Certificate No.", "Certificate No", "Certificate Number"],
   [normalizeFieldLabel("客户名称")]: ["客户名称", "Client Name"],
   [normalizeFieldLabel("地址")]: ["地址", "Address"],
+  [normalizeFieldLabel("仪器名称")]: ["仪器名称", "Description", "Instrument Name"],
+  [normalizeFieldLabel("管理编号")]: ["管理编号", "Management No.", "Management No", "Management Number"],
+  [normalizeFieldLabel("接收日期")]: ["接收日期", "Date of Receipt"],
+  [normalizeFieldLabel("校准日期")]: ["校准日期", "Calibration Date"],
+  [normalizeFieldLabel("建议下次校准日期")]: ["建议下次校准日期", "Due Date"],
+  [normalizeFieldLabel("发布日期")]: ["发布日期", "Issue Date"],
+  [normalizeFieldLabel("型号")]: ["型号", "规格", "型号/规格", "Model/Type", "Model"],
+  [normalizeFieldLabel("规格型号")]: ["规格型号", "型号/规格", "Model/Type", "Model"],
+  [normalizeFieldLabel("制造厂家")]: ["制造厂家", "制造厂商", "制造商", "生产厂家", "Manufacturer", "制造"],
+  [normalizeFieldLabel("制造厂商")]: ["制造厂商", "制造厂家", "制造商", "生产厂家", "Manufacturer", "制造"],
+  [normalizeFieldLabel("生产厂家")]: ["生产厂家", "制造厂家", "制造厂商", "Manufacturer", "制造"],
+  [normalizeFieldLabel("出厂编号")]: ["出厂编号", "Serial Number"],
 };
 const CUSTOMER_NAME_HINTS = ["公司", "有限", "科技", "工程", "集团", "医院", "大学", "中心", "实验室", "研究院"];
 const ADDRESS_HINTS = ["省", "市", "区", "县", "镇", "街", "路", "道", "号", "栋", "室", "房", "园", "巷", "厦", "大道"];
+const NAME_FIELD_HINTS = ["姓名", "名称"];
+const DATE_FIELD_HINTS = ["日期", "时间"];
+const MODEL_FIELD_HINTS = ["型号", "规格", "type", "model"];
+const MANUFACTURER_FIELD_HINTS = ["厂家", "厂商", "制造", "生产"];
+const COMPANY_NAME_HINTS = ["Ltd", "Limited", "Inc", "Corp", "Company", "Co.", "Co,", "公司", "有限"];
+const DATE_LABEL_GROUPS = [
+  { key: normalizeFieldLabel("接收日期"), patterns: ["接收日期", "Date of Receipt"] },
+  { key: normalizeFieldLabel("校准日期"), patterns: ["校准日期", "Calibration Date"] },
+  { key: normalizeFieldLabel("建议下次校准日期"), patterns: ["建议下次校准日期", "Due Date"] },
+  { key: normalizeFieldLabel("发布日期"), patterns: ["发布日期", "Issue Date"] },
+];
 const GENERIC_FIELD_SUFFIXES = [
   "号",
   "码",
@@ -82,7 +105,7 @@ const resetTemplateBtn = document.getElementById("resetTemplateBtn");
 let pdfJsLibPromise;
 let ocrWorkerPromise;
 let tesseractLoadPromise;
-const STATIC_ASSET_VERSION = "20260609-pdfcompat1";
+const STATIC_ASSET_VERSION = "20260609-fieldfix1";
 
 function resolveAssetUrl(relativePath, options = {}) {
   const { versioned = true } = options;
@@ -839,6 +862,125 @@ function countKeywordHits(value, keywords) {
   return keywords.filter((keyword) => String(value || "").includes(keyword)).length;
 }
 
+function isDateFieldKey(fieldKey) {
+  return DATE_FIELD_HINTS.some((hint) => fieldKey.includes(normalizeFieldLabel(hint)));
+}
+
+function isNameLikeFieldKey(fieldKey) {
+  return NAME_FIELD_HINTS.some((hint) => fieldKey.includes(normalizeFieldLabel(hint)));
+}
+
+function isModelFieldKey(fieldKey) {
+  return MODEL_FIELD_HINTS.some((hint) => fieldKey.includes(normalizeFieldLabel(hint)));
+}
+
+function isManufacturerFieldKey(fieldKey) {
+  return MANUFACTURER_FIELD_HINTS.some((hint) => fieldKey.includes(normalizeFieldLabel(hint)));
+}
+
+function isGenericIdentifierFieldKey(fieldKey) {
+  return fieldKey.includes(normalizeFieldLabel("编号")) && fieldKey !== normalizeFieldLabel("证书编号");
+}
+
+function normalizeDateArtifacts(value) {
+  return normalizeWhitespace(String(value || ""))
+    .replace(/(\d)\s*[Hh]\b/g, "$1 日")
+    .replace(/(\d)\s*曰\b/g, "$1 日")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function formatChineseDate(value) {
+  const match = normalizeDateArtifacts(value).match(/(20\d{2})\s*[年./-]\s*(\d{1,2})\s*[月./-]\s*(\d{1,2})\s*(?:日)?/);
+  if (!match) {
+    return "";
+  }
+  const [, year, month, day] = match;
+  return `${year} 年 ${month.padStart(2, "0")} 月 ${day.padStart(2, "0")} 日`;
+}
+
+function extractBestDateValue(value) {
+  const normalized = normalizeDateArtifacts(value);
+  if (!normalized) {
+    return "";
+  }
+
+  const chineseDate = formatChineseDate(normalized);
+  if (chineseDate) {
+    return chineseDate;
+  }
+
+  const slashMatch = normalized.match(/20\d{2}[./-]\d{1,2}[./-]\d{1,2}/);
+  return slashMatch ? formatChineseDate(slashMatch[0]) : "";
+}
+
+function extractBestGenericIdentifier(value) {
+  const compact = normalizeWhitespace(value || "").replace(/\s+/g, "");
+  if (!compact) {
+    return "";
+  }
+
+  const matches = [
+    ...(compact.match(/[A-Za-z0-9]+(?:[-_/][A-Za-z0-9]+){1,5}/g) || []),
+    ...(compact.match(/[A-Za-z]{0,6}\d[A-Za-z0-9._/#()（）+-]{4,}/g) || []),
+  ];
+
+  return [...new Set(matches)]
+    .filter((candidate) => /\d/.test(candidate))
+    .sort((left, right) => right.length - left.length)[0] || "";
+}
+
+function extractBestModelValue(value) {
+  let normalized = normalizeWhitespace(value || "");
+  if (!normalized) {
+    return "";
+  }
+
+  normalized = normalized
+    .replace(/^(?:型号|规格|型号\/规格|\/规格|Model\/Type|Model)\s*[：:]?/i, "")
+    .replace(/^[\\/|｜\s]+/, "")
+    .replace(/制造[|｜/\\\s:：].*$/i, "")
+    .replace(/Manufacturer.*$/i, "")
+    .trim();
+
+  const rangeMatch = normalized.match(/\(?\s*-?\d+(?:\s*~\s*-?\d+)?\s*\)?\s*[A-Za-z%°μµ/0-9.+-]+(?:\/[A-Za-z%°μµ0-9.+-]+)*/);
+  if (rangeMatch) {
+    return normalizeWhitespace(rangeMatch[0]);
+  }
+
+  return /[A-Za-z0-9]/.test(normalized) ? normalized : "";
+}
+
+function extractBestManufacturerValue(value) {
+  const normalized = normalizeWhitespace(value || "");
+  if (!normalized) {
+    return "";
+  }
+
+  const chineseCompany = normalized.match(/[\u3400-\u9fffA-Za-z0-9（）()\-]+(?:有限公司|有限责任公司|公司)/);
+  if (chineseCompany) {
+    return compactChineseValue(chineseCompany[0]);
+  }
+
+  const englishCompany = normalized.match(/[A-Z][A-Za-z0-9&().,\- ]{2,}?(?:Ltd\.?|Limited|Inc\.?|Corp\.?|Company|Co\.?)(?![A-Za-z])/);
+  if (englishCompany) {
+    return normalizeWhitespace(englishCompany[0]);
+  }
+
+  const afterManufacture = normalized.replace(/^.*?制造[|｜/\\\s:：]*/i, "").trim();
+  if (!afterManufacture) {
+    return "";
+  }
+
+  const fallbackEnglish = afterManufacture.match(/[A-Z][A-Za-z0-9&().,\- ]{2,}/);
+  return fallbackEnglish ? normalizeWhitespace(fallbackEnglish[0]) : "";
+}
+
+function hasConflictingDateLabel(value, fieldKey) {
+  const source = String(value || "");
+  return DATE_LABEL_GROUPS.some((group) => group.key !== fieldKey && group.patterns.some((pattern) => source.includes(pattern)));
+}
+
 function stripTrailingPaginationArtifacts(value) {
   let nextValue = normalizeWhitespace(String(value || ""));
   if (!nextValue) {
@@ -1367,7 +1509,39 @@ function normalizeFieldValueForOutput(field, value) {
     }
   }
 
+  if (isGenericIdentifierFieldKey(fieldKey)) {
+    const identifier = extractBestGenericIdentifier(nextValue);
+    if (identifier) {
+      return identifier;
+    }
+  }
+
+  if (isDateFieldKey(fieldKey)) {
+    const dateValue = extractBestDateValue(nextValue);
+    if (dateValue) {
+      return dateValue;
+    }
+  }
+
+  if (isModelFieldKey(fieldKey)) {
+    const modelValue = extractBestModelValue(nextValue);
+    if (modelValue) {
+      nextValue = modelValue;
+    }
+  }
+
+  if (isManufacturerFieldKey(fieldKey)) {
+    const manufacturerValue = extractBestManufacturerValue(nextValue);
+    if (manufacturerValue) {
+      nextValue = manufacturerValue;
+    }
+  }
+
   if (fieldKey === normalizeFieldLabel("客户名称") || fieldKey === normalizeFieldLabel("地址")) {
+    nextValue = compactChineseValue(nextValue);
+  }
+
+  if (isNameLikeFieldKey(fieldKey)) {
     nextValue = compactChineseValue(nextValue);
   }
 
@@ -1397,6 +1571,7 @@ function scoreFieldCandidate(field, value, options = {}) {
   const digitCount = countPatternMatches(normalized, /\d/g);
   const upperCount = countPatternMatches(normalized, /[A-Z]/g);
   const fieldKey = normalizeFieldLabel(field);
+  const originalText = normalizeWhitespace(String(options.rawValue || options.value || value || ""));
   let score = normalized.length * 2 + (options.sourceBonus || 0);
 
   if (fieldKey === normalizeFieldLabel("证书编号")) {
@@ -1422,6 +1597,45 @@ function scoreFieldCandidate(field, value, options = {}) {
     }
     if (/LD|EQ/i.test(identifier)) {
       score -= 120;
+    }
+    return score;
+  }
+
+  if (isGenericIdentifierFieldKey(fieldKey)) {
+    const identifier = extractBestGenericIdentifier(normalized);
+    if (!identifier) {
+      return -Infinity;
+    }
+
+    score += digitCount * 5;
+    score += upperCount * 3;
+    if (identifier.includes("-") || identifier.includes("/")) {
+      score += 40;
+    }
+    if (/[A-Za-z]/.test(identifier) && /\d/.test(identifier)) {
+      score += 80;
+    }
+    if (/日期|Date|地址|Address|名称|Name|客户|Client/i.test(originalText)) {
+      score -= 220;
+    }
+    return score;
+  }
+
+  if (isDateFieldKey(fieldKey)) {
+    const dateValue = extractBestDateValue(normalized);
+    if (!dateValue) {
+      return -Infinity;
+    }
+
+    score += 120;
+    if (normalized === dateValue) {
+      score += 80;
+    }
+    if (hasConflictingDateLabel(originalText, fieldKey)) {
+      score -= 220;
+    }
+    if (/建议下次|Due Date|发布日期|Issue Date/i.test(originalText) && !matchesFieldLabelText(originalText, field)) {
+      score -= 180;
     }
     return score;
   }
@@ -1459,6 +1673,59 @@ function scoreFieldCandidate(field, value, options = {}) {
     }
     if (addressHits === 0 && !(digitCount >= 3 && cjkCount >= 8)) {
       return -Infinity;
+    }
+    return score;
+  }
+
+  if (isNameLikeFieldKey(fieldKey)) {
+    if (cjkCount < 2) {
+      return -Infinity;
+    }
+
+    score += cjkCount * 14;
+    score -= latinCount * 6;
+    score -= digitCount * 10;
+    if (normalized.length <= 8 && digitCount === 0) {
+      score += 140;
+    }
+    if (/日期|Date|编号|No\.?|地址|Address|Model|Type|规格|管理|校准|证书/i.test(originalText) && !matchesFieldLabelText(originalText, field)) {
+      return -Infinity;
+    }
+    return score >= 40 ? score : -Infinity;
+  }
+
+  if (isModelFieldKey(fieldKey)) {
+    const modelValue = extractBestModelValue(normalized);
+    if (!modelValue) {
+      return -Infinity;
+    }
+
+    score += digitCount * 4;
+    score += upperCount * 2;
+    if (/[()（）~/-]/.test(modelValue)) {
+      score += 60;
+    }
+    if (/(?:Pa|kPa|mm|cm|kg|Hz|V|A|W|℃|°C)/i.test(modelValue)) {
+      score += 80;
+    }
+    if (/Ltd|Limited|Inc|Corp|Company|Co\.?|公司|日期|编号|地址/i.test(modelValue)) {
+      score -= 160;
+    }
+    return score;
+  }
+
+  if (isManufacturerFieldKey(fieldKey)) {
+    const manufacturerValue = extractBestManufacturerValue(normalized);
+    if (!manufacturerValue) {
+      return -Infinity;
+    }
+
+    score += countKeywordHits(manufacturerValue, COMPANY_NAME_HINTS) * 60;
+    if (/[A-Za-z]/.test(manufacturerValue)) {
+      score += 40;
+    }
+    if (/型号|规格|日期|编号|Address|地址/i.test(originalText) && !matchesFieldLabelText(originalText, field)) {
+      score -= 80;
     }
     return score;
   }

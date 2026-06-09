@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>批量文件重命名台</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero-card">
+        <div>
+          <p class="eyebrow">Local Batch Rename Console</p>
+          <h1>批量文件重命名台</h1>
+          <p class="hero-copy">
+            选择多个文件后会先按列表显示，再根据你配置的字段和模板批量重命名。
+            原始文件不会被直接改名，下载的 ZIP 里会是重命名后的结果。
+          </p>
+        </div>
+      </header>
+
+      <main class="workspace-grid">
+        <section class="panel stack-panel upload-panel">
+          <div class="panel-head">
+            <h2>1. 上传文件</h2>
+            <button id="clearFilesBtn" class="ghost-btn" type="button">清空文件</button>
+          </div>
+          <div class="upload-layout">
+            <label class="dropzone" for="fileInput" id="dropzone">
+              <input id="fileInput" type="file" multiple />
+              <span class="dropzone-title">点击或拖拽文件到这里</span>
+              <span class="dropzone-subtitle">支持一次选择多个文件，并自动读取文件内容中的字段</span>
+            </label>
+            <div class="selected-files-box">
+              <div class="selected-files-head">
+                <strong>已选文件列表</strong>
+                <span id="fileSummary">尚未选择文件</span>
+              </div>
+              <div id="selectedFilesEmpty" class="selected-files-empty">上传后会在这里按列表显示文件</div>
+              <ul id="selectedFilesList" class="selected-files-list hidden"></ul>
+            </div>
+          </div>
+          <div class="panel-copy upload-note">
+            <span class="upload-note-line">自动读取优先支持 `txt`、`csv`、`json`、`md`、`html`、`pdf`、`docx`。</span>
+            <span class="upload-note-line">字段内容可写成 `姓名: 张三`、`编号：001`、`姓名 张三 编号 001`，或字段名与值分两行。字段名中间就算有空格，比如 `姓 名`、`编 号`，也会自动识别。</span>
+          </div>
+        </section>
+
+        <section class="panel stack-panel">
+          <div class="panel-head panel-head-break">
+            <h2>2. 配置字段</h2>
+            <button id="addFieldBtn" class="accent-btn" type="button">新增字段</button>
+          </div>
+          <p class="panel-copy">字段示例：姓名、编号、部门。模板将使用 <code>{字段名}</code> 作为占位符。</p>
+          <div id="fieldList" class="field-list"></div>
+        </section>
+
+        <section class="panel stack-panel template-panel">
+          <div class="panel-head panel-head-break">
+            <h2>3. 设置命名模板</h2>
+            <button id="resetTemplateBtn" class="ghost-btn" type="button">恢复默认</button>
+          </div>
+          <label class="input-label" for="templateInput">模板</label>
+          <input id="templateInput" class="template-input" type="text" value="{姓名}-{编号}" />
+          <p id="templateHint" class="hint-text">模板里至少需要一个有效字段占位符。</p>
+        </section>
+
+        <section class="panel table-panel">
+          <div class="panel-head">
+            <h2>文件列表</h2>
+            <div class="panel-actions">
+              <button id="reloadExtractBtn" class="ghost-btn" type="button">从内容重新读取</button>
+              <button id="clearValuesBtn" class="ghost-btn" type="button">清空字段值</button>
+            </div>
+          </div>
+          <div id="emptyState" class="empty-state">
+            <h3>先上传文件</h3>
+            <p>上传后，这里会按列表展示每个文件，自动从文件内容里读取字段，并把结果填到对应列里。</p>
+          </div>
+          <div id="tableWrap" class="table-wrap hidden">
+            <table>
+              <thead>
+                <tr id="tableHeadRow"></tr>
+              </thead>
+              <tbody id="tableBody"></tbody>
+            </table>
+          </div>
+        </section>
+      </main>
+
+      <footer class="export-bar">
+        <div>
+          <strong>执行重命名</strong>
+          <p id="statusText">等待文件和模板配置完成</p>
+        </div>
+        <div class="export-actions">
+          <button id="exportZipBtn" class="accent-btn" type="button">重新命名并下载 ZIP</button>
+        </div>
+      </footer>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@v5.0.0/dist/tesseract.min.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>

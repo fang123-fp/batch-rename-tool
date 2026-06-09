@@ -71,12 +71,31 @@ const resetTemplateBtn = document.getElementById("resetTemplateBtn");
 let pdfJsLibPromise;
 let ocrWorkerPromise;
 let tesseractLoadPromise;
-const STATIC_ASSET_VERSION = "20260609-ocrfix2";
+const STATIC_ASSET_VERSION = "20260609-ocrfix3";
 
-function resolveAssetUrl(relativePath) {
+function resolveAssetUrl(relativePath, options = {}) {
+  const { versioned = true } = options;
   const url = new URL(relativePath, window.location.href);
-  url.searchParams.set("v", STATIC_ASSET_VERSION);
+  if (versioned) {
+    url.searchParams.set("v", STATIC_ASSET_VERSION);
+  }
   return url.href;
+}
+
+function formatErrorMessage(error) {
+  if (error?.message) {
+    return error.message;
+  }
+  if (typeof error === "string" && error.trim()) {
+    return error.trim();
+  }
+  if (error && typeof error.toString === "function") {
+    const value = String(error).trim();
+    if (value && value !== "[object Object]") {
+      return value;
+    }
+  }
+  return "未知错误";
 }
 
 function loadScript(url) {
@@ -1137,8 +1156,8 @@ async function getOcrWorker() {
   if (!ocrWorkerPromise) {
     ocrWorkerPromise = tesseract.createWorker("chi_sim+eng", 1, {
       workerPath: resolveAssetUrl("./vendor/tesseract/worker.min.js"),
-      corePath: resolveAssetUrl("./vendor/tesseract-core/"),
-      langPath: resolveAssetUrl("./vendor/tessdata/"),
+      corePath: resolveAssetUrl("./vendor/tesseract-core/", { versioned: false }),
+      langPath: resolveAssetUrl("./vendor/tessdata/", { versioned: false }),
     }).catch((error) => {
       ocrWorkerPromise = null;
       throw error;
@@ -1495,7 +1514,7 @@ async function populateRecordFromContent(record, options = {}) {
   } catch (error) {
     console.error(error);
     record.contentState = "error";
-    record.contentMessage = `读取文件内容失败：${error?.message || "未知错误"}`;
+    record.contentMessage = `读取文件内容失败：${formatErrorMessage(error)}`;
   }
 }
 

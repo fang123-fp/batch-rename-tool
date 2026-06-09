@@ -82,7 +82,7 @@ const resetTemplateBtn = document.getElementById("resetTemplateBtn");
 let pdfJsLibPromise;
 let ocrWorkerPromise;
 let tesseractLoadPromise;
-const STATIC_ASSET_VERSION = "20260609-ocrfix5";
+const STATIC_ASSET_VERSION = "20260609-pdfcompat1";
 
 function resolveAssetUrl(relativePath, options = {}) {
   const { versioned = true } = options;
@@ -1600,10 +1600,13 @@ function syncValuesFromContent(record) {
 
 async function getPdfJsLib() {
   if (!pdfJsLibPromise) {
-    pdfJsLibPromise = import(resolveAssetUrl("./vendor/pdf.min.mjs"))
-      .then((module) => {
-        module.GlobalWorkerOptions.workerSrc = resolveAssetUrl("./vendor/pdf.worker.min.mjs");
-        return module;
+    pdfJsLibPromise = loadScript(resolveAssetUrl("./vendor/pdf.legacy.min.js"))
+      .then(() => {
+        if (!window.pdfjsLib?.getDocument) {
+          throw new Error("PDF 引擎加载失败，请检查站点资源是否完整");
+        }
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc = resolveAssetUrl("./vendor/pdf.worker.legacy.min.js");
+        return window.pdfjsLib;
       })
       .catch((error) => {
         pdfJsLibPromise = null;
@@ -1615,7 +1618,7 @@ async function getPdfJsLib() {
 
 async function extractPdfText(file) {
   const pdfjsLib = await getPdfJsLib();
-  const documentTask = pdfjsLib.getDocument({ data: await file.arrayBuffer() });
+  const documentTask = pdfjsLib.getDocument({ data: new Uint8Array(await file.arrayBuffer()) });
   const pdf = await documentTask.promise;
   const chunks = [];
   for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
@@ -1665,7 +1668,7 @@ async function extractPdfText(file) {
 
 async function extractPdfTextWithOcr(file, fields = state.fields) {
   const pdfjsLib = await getPdfJsLib();
-  const documentTask = pdfjsLib.getDocument({ data: await file.arrayBuffer() });
+  const documentTask = pdfjsLib.getDocument({ data: new Uint8Array(await file.arrayBuffer()) });
   const pdf = await documentTask.promise;
   const worker = await getOcrWorker();
   const pageCount = Math.min(pdf.numPages, OCR_MAX_PDF_PAGES);

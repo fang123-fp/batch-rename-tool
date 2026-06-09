@@ -76,3 +76,17 @@
   - `证书编号` => `Z20252-6244005`
   - `客户名称` => `瑞因细胞工程科技（广州）有限公司`
   - `地址` => `广州市黄埔区开源大道188号自编七栋101房`
+
+## 2026-06-09 PDF Compatibility Hotfix
+- 已将 PDF 解析链从 `pdf.js 5.6` 的现代 `mjs` 构建切换到官方 `pdfjs-dist@3.11.174 legacy/build`
+- 这样可以避开 Chrome 109 缺失的 `Uint8Array.prototype.toHex`、`Promise.withResolvers`、`Response.bytes` 等新 API 依赖
+- 页面侧改为按需加载 `vendor/pdf.legacy.min.js`，并指向配套的 `vendor/pdf.worker.legacy.min.js`
+- 已同步将静态资源版本号提升为 `20260609-pdfcompat1`，避免 GitHub Pages 访问页继续命中旧缓存
+
+## 2026-06-09 PDF Compatibility Verification
+- 对比了当前 `pdf.js 5.6` vendor 文件，确认其包含 Chrome 109 不稳定或缺失的新 API：`.toHex(`、`Promise.withResolvers`、`URL.parse`、`.bytes()`、`Uint8Array.fromBase64`
+- 对比了官方 `pdfjs-dist@3.11.174 legacy/build`，上述兼容性敏感 API 在构建产物中未出现
+- 用 headless Chrome 打开本地 smoke 页面，确认 `vendor/pdf.legacy.min.js` 加载后 `pdfjsLib.getDocument` 可用
+- 本地语法检查通过：
+  - `node --check app.js`
+  - `node --check server.js`

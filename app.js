@@ -26,6 +26,8 @@ const FIELD_LABEL_ALIASES = {
   [normalizeFieldLabel("客户名称")]: ["客户名称", "Client Name"],
   [normalizeFieldLabel("地址")]: ["地址", "Address"],
 };
+const CUSTOMER_NAME_HINTS = ["公司", "有限", "科技", "工程", "集团", "医院", "大学", "中心", "实验室", "研究院"];
+const ADDRESS_HINTS = ["省", "市", "区", "县", "镇", "街", "路", "道", "号", "栋", "室", "房", "园", "巷", "厦", "大道"];
 const GENERIC_FIELD_SUFFIXES = [
   "号",
   "码",
@@ -80,7 +82,7 @@ const resetTemplateBtn = document.getElementById("resetTemplateBtn");
 let pdfJsLibPromise;
 let ocrWorkerPromise;
 let tesseractLoadPromise;
-const STATIC_ASSET_VERSION = "20260609-ocrfix4";
+const STATIC_ASSET_VERSION = "20260609-ocrfix5";
 
 function resolveAssetUrl(relativePath, options = {}) {
   const { versioned = true } = options;
@@ -829,6 +831,14 @@ function extractBestStructuredIdentifier(value) {
   return matches.sort((left, right) => right.length - left.length)[0] || "";
 }
 
+function countPatternMatches(value, pattern) {
+  return (String(value || "").match(pattern) || []).length;
+}
+
+function countKeywordHits(value, keywords) {
+  return keywords.filter((keyword) => String(value || "").includes(keyword)).length;
+}
+
 function stripTrailingPaginationArtifacts(value) {
   let nextValue = normalizeWhitespace(String(value || ""));
   if (!nextValue) {
@@ -1024,7 +1034,9 @@ function buildStructuredTextFromOcrLines(lines, fields) {
       return;
     }
 
-    const value = normalizeFieldValueForOutput(field, pickBestOcrValueCandidate(labelLine, lines, field));
+    const value = selectBestFieldCandidate(field, [
+      { value: normalizeFieldValueForOutput(field, pickBestOcrValueCandidate(labelLine, lines, field)), sourceBonus: 12 },
+    ]);
     if (!isUsableExtractedValue(value, field)) {
       return;
     }
@@ -1194,24 +1206,33 @@ async function buildStructuredTextFromOcrPage(canvas, rawCanvas, worker, lines, 
   for (const field of fields) {
     const labelLine = findBestOcrLabelLine(lines, field);
     const regionHint = pageNumber === 1 ? getKnownPdfFieldRegionHint(field) : null;
-
-    let value = "";
+    const candidates = [];
     if (labelLine) {
-      value = extractInlineFieldValue(labelLine.text, field);
-      if (shouldRetryOcrValue(value, field)) {
-        value = normalizeFieldValueForOutput(field, stripTrailingPaginationArtifacts(pickBestOcrValueCandidate(labelLine, lines, field)));
+      const inlineValue = extractInlineFieldValue(labelLine.text, field);
+      if (inlineValue) {
+        candidates.push({ value: inlineValue, sourceBonus: 18 });
       }
-      if (shouldRetryOcrValue(value, field)) {
-        value = normalizeFieldValueForOutput(field, await extractOcrValueByCrop(canvas, worker, labelLine));
+
+      const nearbyValue = normalizeFieldValueForOutput(field, stripTrailingPaginationArtifacts(pickBestOcrValueCandidate(labelLine, lines, field)));
+      if (isUsableExtractedValue(nearbyValue, field)) {
+        candidates.push({ value: nearbyValue, sourceBonus: 14 });
+      }
+
+      const cropValue = normalizeFieldValueForOutput(field, await extractOcrValueByCrop(canvas, worker, labelLine));
+      if (isUsableExtractedValue(cropValue, field)) {
+        candidates.push({ value: cropValue, sourceBonus: 10 });
       }
     }
 
-    if (shouldRetryOcrValue(value, field) && regionHint) {
+    if (regionHint) {
       const sourceCanvas = regionHint.useThresholded ? canvas : (rawCanvas || canvas);
-      value = normalizeFieldValueForOutput(field, await extractOcrValueFromRegion(sourceCanvas, worker, regionHint));
+      const regionValue = normalizeFieldValueForOutput(field, await extractOcrValueFromRegion(sourceCanvas, worker, regionHint));
+      if (isUsableExtractedValue(regionValue, field)) {
+        candidates.push({ value: regionValue, sourceBonus: 16 });
+      }
     }
 
-    value = normalizeFieldValueForOutput(field, value);
+    const value = selectBestFieldCandidate(field, candidates);
     if (isUsableExtractedValue(value, field)) {
       results.push(`${field}：${value}`);
     }
@@ -1353,29 +1374,129 @@ function normalizeFieldValueForOutput(field, value) {
   return nextValue;
 }
 
-function isUsableExtractedValue(value, field) {
+function scoreFieldCandidate(field, value, options = {}) {
   const normalized = normalizeFieldValueForOutput(field, value);
   if (!normalized) {
-    return false;
+    return -Infinity;
   }
 
   if (!normalizeWhitespace(stripTrailingPaginationArtifacts(normalized))) {
-    return false;
+    return -Infinity;
   }
 
   if (!hasReadableContent(normalized)) {
-    return false;
+    return -Infinity;
   }
 
   if (normalizeFieldLabel(normalized) === normalizeFieldLabel(field)) {
-    return false;
+    return -Infinity;
   }
 
-  if (looksLikeStructuredIdentifier(normalized)) {
-    return true;
+  const cjkCount = countPatternMatches(normalized, /[\u3400-\u9fff]/g);
+  const latinCount = countPatternMatches(normalized, /[A-Za-z]/g);
+  const digitCount = countPatternMatches(normalized, /\d/g);
+  const upperCount = countPatternMatches(normalized, /[A-Z]/g);
+  const fieldKey = normalizeFieldLabel(field);
+  let score = normalized.length * 2 + (options.sourceBonus || 0);
+
+  if (fieldKey === normalizeFieldLabel("证书编号")) {
+    const identifier = extractBestStructuredIdentifier(normalized);
+    if (!identifier) {
+      return -Infinity;
+    }
+
+    score += digitCount * 6;
+    score += upperCount * 4;
+    if (/^[A-Z]\d{4,}-\d{4,}$/.test(identifier)) {
+      score += 220;
+    } else if (/^\d{4,}-\d{4,}$/.test(identifier)) {
+      score += 150;
+    } else if (/^[A-Z]?\d[\dA-Za-z._/#()（）+-]{5,}$/.test(identifier)) {
+      score += 90;
+    }
+    if (identifier.includes("-")) {
+      score += 30;
+    }
+    if (/[A-Za-z]/.test(identifier.slice(1))) {
+      score -= 80;
+    }
+    if (/LD|EQ/i.test(identifier)) {
+      score -= 120;
+    }
+    return score;
   }
 
-  return !isLikelyOcrLabel(normalized, field);
+  if (fieldKey === normalizeFieldLabel("客户名称")) {
+    if (cjkCount < 4) {
+      return -Infinity;
+    }
+
+    score += cjkCount * 12;
+    score -= latinCount * 8;
+    score -= digitCount * 8;
+    score += countKeywordHits(normalized, CUSTOMER_NAME_HINTS) * 40;
+    if (/地址|Address|仪器|Description|型号|规格|证书|编号|Client\s*Name/i.test(normalized)) {
+      score -= 120;
+    }
+    if (latinCount > cjkCount) {
+      score -= 60;
+    }
+    return score >= 40 ? score : -Infinity;
+  }
+
+  if (fieldKey === normalizeFieldLabel("地址")) {
+    if (cjkCount < 4) {
+      return -Infinity;
+    }
+
+    const addressHits = countKeywordHits(normalized, ADDRESS_HINTS);
+    score += cjkCount * 8;
+    score += digitCount * 3;
+    score += addressHits * 45;
+    score -= latinCount * 6;
+    if (/仪器|Description|客户|公司|Client\s*Name|Model|Serial/i.test(normalized)) {
+      score -= 120;
+    }
+    if (addressHits === 0 && !(digitCount >= 3 && cjkCount >= 8)) {
+      return -Infinity;
+    }
+    return score;
+  }
+
+  score += cjkCount * 6;
+  score += digitCount * 2;
+  score -= latinCount;
+  if (isLikelyOcrLabel(normalized, field)) {
+    score -= 100;
+  }
+  return score > 0 ? score : -Infinity;
+}
+
+function isUsableExtractedValue(value, field, options = {}) {
+  return Number.isFinite(scoreFieldCandidate(field, value, options));
+}
+
+function selectBestFieldCandidate(field, candidates = []) {
+  const ranked = candidates
+    .map((candidate) => {
+      if (candidate && typeof candidate === "object") {
+        const normalized = normalizeFieldValueForOutput(field, candidate.value);
+        return {
+          value: normalized,
+          score: scoreFieldCandidate(field, normalized, candidate),
+        };
+      }
+
+      const normalized = normalizeFieldValueForOutput(field, candidate);
+      return {
+        value: normalized,
+        score: scoreFieldCandidate(field, normalized),
+      };
+    })
+    .filter((candidate) => candidate.value && Number.isFinite(candidate.score))
+    .sort((left, right) => right.score - left.score);
+
+  return ranked[0]?.value || "";
 }
 
 function truncateAtNextField(value, currentField) {
@@ -1385,15 +1506,16 @@ function truncateAtNextField(value, currentField) {
   return cleanExtractedValue(withoutPagination);
 }
 
-function extractFieldValueFromLines(text, field) {
+function collectFieldCandidatesFromLines(text, field) {
   const lines = normalizeExtractedText(text || "")
     .split(/\r?\n/)
     .map((line) => normalizeWhitespace(line))
     .filter(Boolean);
   const fieldPatterns = getFlexibleFieldPatterns(field);
+  const candidates = [];
 
   if (!lines.length || !fieldPatterns.length) {
-    return "";
+    return candidates;
   }
 
   for (let index = 0; index < lines.length; index += 1) {
@@ -1411,19 +1533,23 @@ function extractFieldValueFromLines(text, field) {
 
       const inlineCandidate = normalizeFieldValueForOutput(field, truncateAtNextField(inlineMatch[1], field));
       if (isUsableExtractedValue(inlineCandidate, field)) {
-        return inlineCandidate;
+        candidates.push({ value: inlineCandidate, sourceBonus: 20 });
       }
     }
 
     for (let offset = 1; offset <= 2 && index + offset < lines.length; offset += 1) {
       const candidate = normalizeFieldValueForOutput(field, truncateAtNextField(lines[index + offset], field));
       if (isUsableExtractedValue(candidate, field)) {
-        return candidate;
+        candidates.push({ value: candidate, sourceBonus: 14 - (offset * 2) });
       }
     }
   }
 
-  return "";
+  return candidates;
+}
+
+function extractFieldValueFromLines(text, field) {
+  return selectBestFieldCandidate(field, collectFieldCandidatesFromLines(text, field));
 }
 
 function extractFieldValueFromText(text, field) {
@@ -1431,6 +1557,7 @@ function extractFieldValueFromText(text, field) {
   if (!text || !fieldPatterns.length) {
     return "";
   }
+  const candidates = [];
   const patterns = fieldPatterns.flatMap((fieldPattern) => ([
     new RegExp(`(?:^|[\\n\\r])\\s*${fieldPattern}\\s*[：:]\\s*([^\\n\\r]+)`, "i"),
     new RegExp(`${fieldPattern}\\s*[：:]\\s*([^\\n\\r]+)`, "i"),
@@ -1440,18 +1567,22 @@ function extractFieldValueFromText(text, field) {
   ]));
 
   for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (!match || !match[1]) {
-      continue;
-    }
+    const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
+    const globalPattern = new RegExp(pattern.source, flags);
+    for (const match of text.matchAll(globalPattern)) {
+      if (!match || !match[1]) {
+        continue;
+      }
 
-    const candidate = normalizeFieldValueForOutput(field, truncateAtNextField(match[1], field));
-    if (isUsableExtractedValue(candidate, field)) {
-      return candidate;
+      const candidate = normalizeFieldValueForOutput(field, truncateAtNextField(match[1], field));
+      if (isUsableExtractedValue(candidate, field)) {
+        candidates.push({ value: candidate, sourceBonus: 12 });
+      }
     }
   }
 
-  return extractFieldValueFromLines(text, field);
+  candidates.push(...collectFieldCandidatesFromLines(text, field));
+  return selectBestFieldCandidate(field, candidates);
 }
 
 function syncValuesFromContent(record) {

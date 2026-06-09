@@ -71,9 +71,12 @@ const resetTemplateBtn = document.getElementById("resetTemplateBtn");
 let pdfJsLibPromise;
 let ocrWorkerPromise;
 let tesseractLoadPromise;
+const STATIC_ASSET_VERSION = "20260609-ocrfix2";
 
 function resolveAssetUrl(relativePath) {
-  return new URL(relativePath, window.location.href).href;
+  const url = new URL(relativePath, window.location.href);
+  url.searchParams.set("v", STATIC_ASSET_VERSION);
+  return url.href;
 }
 
 function loadScript(url) {
@@ -1477,7 +1480,7 @@ async function populateRecordFromContent(record, options = {}) {
         && !record.ocrAttempted
         && getFilledFieldCount(record) < state.fields.length
       ) {
-        record.contentMessage = "正在尝试识别扫描版 PDF...";
+        record.contentMessage = "正在尝试识别扫描版 PDF，可能需要 1 分钟左右...";
         const ocrText = await extractPdfTextWithOcr(record.file, state.fields);
         record.ocrAttempted = true;
 

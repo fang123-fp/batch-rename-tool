@@ -62,6 +62,13 @@ node server.js
   - `姓名` 换行后下一行是 `张三`
 - 如果某个文件类型暂不支持自动读取，页面会明确提示，你可以手动补字段值后继续下载
 
+## 线上部署与国内访问
+- 当前版本已经把 `JSZip`、`pdf.js`、`Tesseract` 和 OCR 语言包改为站内同源资源，不再依赖运行时境外 CDN
+- PDF OCR 改成按需加载，只有在 PDF 无法直接提取文字、需要 OCR 时才会加载识别引擎
+- 如果继续使用 GitHub Pages，建议绑定自定义域名，优先使用 `www` 子域名
+- 如果主要用户在中国大陆，长期更稳的方案是迁到中国香港静态托管，或在完成 ICP 后使用中国大陆 CDN / 静态站点服务
+- 详细部署建议见 [docs/china-deployment.md](/Users/fangpei/Documents/Codex/2026-06-08/new-chat/outputs/batch-rename-tool/docs/china-deployment.md)
+
 ## 说明
 - 这个工具不会直接修改你电脑上的原始文件
 - 它会把重命名后的文件导出为一个 ZIP 下载包

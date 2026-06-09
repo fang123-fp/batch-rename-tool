@@ -43,6 +43,7 @@
           <div class="panel-copy upload-note">
             <span class="upload-note-line">自动读取优先支持 `txt`、`csv`、`json`、`md`、`html`、`pdf`、`docx`。</span>
             <span class="upload-note-line">字段内容可写成 `姓名: 张三`、`编号：001`、`姓名 张三 编号 001`，或字段名与值分两行。字段名中间就算有空格，比如 `姓 名`、`编 号`，也会自动识别。</span>
+            <span class="upload-note-line">PDF 的 OCR 识别引擎会在首次需要时从站内按需加载，首轮可能稍慢，之后会复用。</span>
           </div>
         </section>
 
@@ -99,8 +100,7 @@
       </footer>
     </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@v5.0.0/dist/tesseract.min.js"></script>
+    <script src="./vendor/jszip.min.js"></script>
     <script src="./app.js"></script>
   </body>
 </html>

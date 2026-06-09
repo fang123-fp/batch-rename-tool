@@ -1,11 +1,13 @@
 const state = {
   fields: ["姓名", "编号"],
+  pendingFields: [],
   files: [],
   template: "{姓名}-{编号}",
   status: "等待文件上传和字段读取完成",
   statusKind: "",
   isExtracting: false,
   extractionRunId: 0,
+  focusPendingFieldId: "",
 };
 
 const TEXT_EXTENSIONS = new Set([".txt", ".csv", ".tsv", ".json", ".md", ".markdown", ".html", ".htm", ".xml"]);
@@ -68,6 +70,44 @@ const resetTemplateBtn = document.getElementById("resetTemplateBtn");
 
 let pdfJsLibPromise;
 let ocrWorkerPromise;
+let tesseractLoadPromise;
+
+function resolveAssetUrl(relativePath) {
+  return new URL(relativePath, window.location.href).href;
+}
+
+function loadScript(url) {
+  return new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = url;
+    script.async = true;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error(`脚本加载失败：${url}`));
+    document.head.appendChild(script);
+  });
+}
+
+async function ensureTesseractLoaded() {
+  if (window.Tesseract?.createWorker) {
+    return window.Tesseract;
+  }
+
+  if (!tesseractLoadPromise) {
+    tesseractLoadPromise = loadScript(resolveAssetUrl("./vendor/tesseract/tesseract.min.js"))
+      .catch((error) => {
+        tesseractLoadPromise = null;
+        throw error;
+      });
+  }
+
+  await tesseractLoadPromise;
+
+  if (!window.Tesseract?.createWorker) {
+    throw new Error("OCR 引擎加载失败，请检查站点资源是否完整");
+  }
+
+  return window.Tesseract;
+}
 
 function splitName(name) {
   const lastDot = name.lastIndexOf(".");
@@ -89,6 +129,10 @@ function normalizeWhitespace(value) {
 
 function normalizeFieldLabel(value) {
   return String(value || "").replace(/\s+/g, "").trim();
+}
+
+function createLocalId() {
+  return crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 function hasCjkCharacters(value) {
@@ -163,7 +207,7 @@ function renameFieldAcrossState(index, nextName) {
 }
 
 function syncPendingFieldInputs() {
-  const inputs = Array.from(fieldList.querySelectorAll(".field-input"));
+  const inputs = Array.from(fieldList.querySelectorAll(".field-input[data-field-index]"));
   if (!inputs.length) {
     return false;
   }
@@ -182,6 +226,26 @@ function syncPendingFieldInputs() {
   }
 
   return changed;
+}
+
+async function commitPendingField(pendingFieldId, rawValue) {
+  const nextName = normalizeWhitespace(rawValue);
+  if (!nextName) {
+    return false;
+  }
+
+  const pendingIndex = state.pendingFields.findIndex((field) => field.id === pendingFieldId);
+  if (pendingIndex < 0) {
+    return false;
+  }
+
+  state.pendingFields.splice(pendingIndex, 1);
+  state.focusPendingFieldId = "";
+  state.fields.push(ensureUniqueFieldName(nextName));
+  applyFieldsToRecords();
+  render();
+  await refreshAutoExtraction(state.files, { reReadContent: false });
+  return true;
 }
 
 function buildRawName(record) {
@@ -247,6 +311,7 @@ function renderFieldList() {
 
     const input = document.createElement("input");
     input.className = "field-input";
+    input.dataset.fieldIndex = String(index);
     input.value = field;
     input.setAttribute("aria-label", `字段 ${index + 1}`);
     input.addEventListener("change", async () => {
@@ -287,6 +352,79 @@ function renderFieldList() {
     card.append(input, actionRow);
     fieldList.append(card);
   });
+
+  state.pendingFields.forEach((draft, index) => {
+    const card = document.createElement("div");
+    card.className = "field-card";
+
+    const input = document.createElement("input");
+    input.className = "field-input";
+    input.dataset.pendingFieldId = draft.id;
+    input.value = draft.value;
+    input.placeholder = "输入字段名";
+    input.setAttribute("aria-label", `新增字段 ${index + 1}`);
+
+    const saveBtn = document.createElement("button");
+    saveBtn.type = "button";
+    saveBtn.className = "mini-btn";
+    saveBtn.textContent = "添加";
+    saveBtn.disabled = !normalizeWhitespace(draft.value);
+
+    const commitDraft = async () => {
+      if (!normalizeWhitespace(input.value)) {
+        return;
+      }
+      saveBtn.disabled = true;
+      await commitPendingField(draft.id, input.value);
+    };
+
+    input.addEventListener("input", () => {
+      draft.value = input.value;
+      saveBtn.disabled = !normalizeWhitespace(input.value);
+    });
+    input.addEventListener("change", () => {
+      if (normalizeWhitespace(input.value)) {
+        void commitDraft();
+      }
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !saveBtn.disabled) {
+        event.preventDefault();
+        void commitDraft();
+      }
+    });
+
+    saveBtn.addEventListener("click", () => {
+      void commitDraft();
+    });
+
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
+    removeBtn.className = "mini-btn";
+    removeBtn.textContent = "删除";
+    removeBtn.addEventListener("click", () => {
+      state.pendingFields = state.pendingFields.filter((field) => field.id !== draft.id);
+      if (state.focusPendingFieldId === draft.id) {
+        state.focusPendingFieldId = "";
+      }
+      renderFieldList();
+    });
+
+    const actionRow = document.createElement("div");
+    actionRow.className = "field-card-actions";
+    actionRow.append(saveBtn, removeBtn);
+
+    card.append(input, actionRow);
+    fieldList.append(card);
+  });
+
+  if (state.focusPendingFieldId) {
+    const pendingInput = fieldList.querySelector(`[data-pending-field-id="${state.focusPendingFieldId}"]`);
+    if (pendingInput) {
+      pendingInput.focus();
+    }
+    state.focusPendingFieldId = "";
+  }
 }
 
 function insertToken(field) {
@@ -490,7 +628,7 @@ function makeRecord(file) {
     autoValues[field] = "";
   });
   return {
-    id: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    id: createLocalId(),
     file,
     originalName: file.name,
     baseName: parts.base,
@@ -610,6 +748,50 @@ function buildFlexibleFieldPattern(field) {
     return "";
   }
   return Array.from(compact).map(escapeRegExp).join("\\s*");
+}
+
+function stripTrailingPaginationArtifacts(value) {
+  let nextValue = normalizeWhitespace(String(value || ""));
+  if (!nextValue) {
+    return "";
+  }
+
+  const patterns = [
+    /\s*第\s*\d+\s*[页责責]\s*(?:共\s*\d+\s*[页责責])?$/i,
+    /\s*共\s*\d+\s*[页责責]\s*(?:第\s*\d+\s*[页责責])?$/i,
+    /\s*Page\s*\d*\s*(?:of\s*\d+)?$/i,
+    /\s*Page\s*of\s*$/i,
+  ];
+
+  let changed = true;
+  while (changed && nextValue) {
+    changed = false;
+    patterns.forEach((pattern) => {
+      const trimmed = nextValue.replace(pattern, "").trim();
+      if (trimmed !== nextValue) {
+        nextValue = trimmed;
+        changed = true;
+      }
+    });
+  }
+
+  return nextValue;
+}
+
+function extractInlineFieldValue(text, field) {
+  const source = normalizeWhitespace(text || "");
+  const fieldPattern = buildFlexibleFieldPattern(field);
+  if (!source || !fieldPattern) {
+    return "";
+  }
+
+  const pattern = new RegExp(`${fieldPattern}\\s*[：:]?\\s*(.+)$`, "i");
+  const match = source.match(pattern);
+  if (!match || !match[1]) {
+    return "";
+  }
+
+  return cleanExtractedValue(stripTrailingPaginationArtifacts(match[1]));
 }
 
 function normalizeExtractedText(text) {
@@ -786,6 +968,20 @@ function scoreOcrLineText(text) {
   return score;
 }
 
+function looksLikeStructuredIdentifier(value) {
+  const normalized = normalizeWhitespace(value || "");
+  if (!normalized) {
+    return false;
+  }
+
+  const digitCount = (normalized.match(/\d/g) || []).length;
+  if (digitCount < 2) {
+    return false;
+  }
+
+  return /^[A-Za-z0-9\s._/#()（）+-]+$/.test(normalized);
+}
+
 function pickBestOcrTextLine(text) {
   return String(text || "")
     .split(/\r?\n/)
@@ -801,6 +997,9 @@ function shouldRetryOcrValue(value, field) {
   }
   if (normalizeFieldLabel(normalized) === normalizeFieldLabel(field)) {
     return true;
+  }
+  if (looksLikeStructuredIdentifier(normalized)) {
+    return false;
   }
   if (isLikelyOcrLabel(normalized, field)) {
     return true;
@@ -908,7 +1107,10 @@ async function buildStructuredTextFromOcrPage(canvas, rawCanvas, worker, lines, 
 
     let value = "";
     if (labelLine) {
-      value = cleanExtractedValue(pickBestOcrValueCandidate(labelLine, lines, field));
+      value = extractInlineFieldValue(labelLine.text, field);
+      if (shouldRetryOcrValue(value, field)) {
+        value = cleanExtractedValue(stripTrailingPaginationArtifacts(pickBestOcrValueCandidate(labelLine, lines, field)));
+      }
       if (shouldRetryOcrValue(value, field)) {
         value = await extractOcrValueByCrop(canvas, worker, labelLine);
       }
@@ -927,15 +1129,16 @@ async function buildStructuredTextFromOcrPage(canvas, rawCanvas, worker, lines, 
 }
 
 async function getOcrWorker() {
-  if (!window.Tesseract?.createWorker) {
-    throw new Error("OCR 引擎未加载完成，请联网后重试");
-  }
+  const tesseract = await ensureTesseractLoaded();
 
   if (!ocrWorkerPromise) {
-    ocrWorkerPromise = window.Tesseract.createWorker("chi_sim+eng", 1, {
-      workerPath: "https://cdn.jsdelivr.net/npm/tesseract.js@v5.0.0/dist/worker.min.js",
-      corePath: "https://cdn.jsdelivr.net/npm/tesseract.js-core@v5.0.0",
-      langPath: "https://tessdata.projectnaptha.com/4.0.0_fast",
+    ocrWorkerPromise = tesseract.createWorker("chi_sim+eng", 1, {
+      workerPath: resolveAssetUrl("./vendor/tesseract/worker.min.js"),
+      corePath: resolveAssetUrl("./vendor/tesseract-core/"),
+      langPath: resolveAssetUrl("./vendor/tessdata/"),
+    }).catch((error) => {
+      ocrWorkerPromise = null;
+      throw error;
     });
   }
 
@@ -1043,7 +1246,8 @@ function cleanExtractedValue(value) {
 function truncateAtNextField(value, currentField) {
   const boundaryIndex = findNextFieldBoundary(value, currentField);
   const sliced = boundaryIndex >= 0 ? value.slice(0, boundaryIndex) : value;
-  return cleanExtractedValue(sliced);
+  const withoutPagination = stripTrailingPaginationArtifacts(sliced);
+  return cleanExtractedValue(withoutPagination);
 }
 
 function extractFieldValueFromText(text, field) {
@@ -1087,10 +1291,15 @@ function syncValuesFromContent(record) {
 
 async function getPdfJsLib() {
   if (!pdfJsLibPromise) {
-    pdfJsLibPromise = import("https://cdn.jsdelivr.net/npm/pdfjs-dist@5.6.205/build/pdf.min.mjs").then((module) => {
-      module.GlobalWorkerOptions.workerSrc = "https://cdn.jsdelivr.net/npm/pdfjs-dist@5.6.205/build/pdf.worker.min.mjs";
-      return module;
-    });
+    pdfJsLibPromise = import(resolveAssetUrl("./vendor/pdf.min.mjs"))
+      .then((module) => {
+        module.GlobalWorkerOptions.workerSrc = resolveAssetUrl("./vendor/pdf.worker.min.mjs");
+        return module;
+      })
+      .catch((error) => {
+        pdfJsLibPromise = null;
+        throw error;
+      });
   }
   return pdfJsLibPromise;
 }
@@ -1340,10 +1549,10 @@ templateInput.addEventListener("input", () => {
 });
 
 addFieldBtn.addEventListener("click", async () => {
-  state.fields.push(ensureUniqueFieldName(`字段${state.fields.length + 1}`));
-  applyFieldsToRecords();
-  render();
-  await refreshAutoExtraction(state.files, { reReadContent: false });
+  const pendingFieldId = createLocalId();
+  state.pendingFields.push({ id: pendingFieldId, value: "" });
+  state.focusPendingFieldId = pendingFieldId;
+  renderFieldList();
 });
 
 clearFilesBtn.addEventListener("click", clearFiles);

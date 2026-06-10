@@ -16,10 +16,19 @@ const TEXT_EXTENSIONS = new Set([".txt", ".csv", ".tsv", ".json", ".md", ".markd
 const FIELD_BOUNDARY_PREFIX = "(?:\\n\\s*|[\\s,，;；]+)";
 const PDF_MAX_PAGES_TO_READ = 1;
 const KNOWN_PDF_FIELD_REGION_HINTS = {
-  [normalizeFieldLabel("证书编号")]: { left: 0.19, top: 0.165, width: 0.16, height: 0.028, psm: "7", useThresholded: true },
+  [normalizeFieldLabel("证书编号")]: {
+    left: 0.19,
+    top: 0.165,
+    width: 0.17,
+    height: 0.028,
+    psm: "7",
+    useThresholded: false,
+    scale: 1,
+    whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-",
+    allowAlternateCanvas: false,
+  },
   [normalizeFieldLabel("客户名称")]: { left: 0.18, top: 0.18, width: 0.70, height: 0.07, psm: "6" },
-  [normalizeFieldLabel("地址")]: { left: 0.20, top: 0.245, width: 0.45, height: 0.06, psm: "7" },
-  [normalizeFieldLabel("仪器名称")]: { left: 0.18, top: 0.29, width: 0.70, height: 0.06, psm: "6" },
+  [normalizeFieldLabel("仪器名称")]: { left: 0.18, top: 0.29, width: 0.70, height: 0.06, psm: "6", useThresholded: false, scale: 2, allowAlternateCanvas: false },
 };
 const FIELD_LABEL_ALIASES = {
   [normalizeFieldLabel("证书编号")]: ["证书编号", "证书号", "Certificate No.", "Certificate No", "Certificate Number"],
@@ -108,7 +117,7 @@ let tesseractLoadPromise;
 let ocrQueueTail = Promise.resolve();
 let activeOcrJobCount = 0;
 let waitingOcrJobCount = 0;
-const STATIC_ASSET_VERSION = "20260610-certguard1";
+const STATIC_ASSET_VERSION = "20260610-certregion2";
 
 function resolveAssetUrl(relativePath, options = {}) {
   const { versioned = true } = options;
@@ -952,6 +961,16 @@ function stripLeadingFieldLabelPrefix(field, value) {
   return nextValue.replace(prefixPattern, "").trim();
 }
 
+function hasExplicitFieldTextPrefix(value, field) {
+  const rawText = String(value || "");
+  const rawField = String(field || "").trim();
+  if (!rawText || !rawField) {
+    return false;
+  }
+
+  return new RegExp(`^\\s*${escapeRegExp(rawField)}\\s*(?:[：:]|\\s|$)`).test(rawText);
+}
+
 function extractBestStructuredIdentifier(value) {
   const compact = normalizeWhitespace(value || "").replace(/\s+/g, "");
   const matches = compact.match(/[A-Za-z]?\d[\dA-Za-z._/#()（）+-]{5,}/g) || [];
@@ -1052,13 +1071,38 @@ function looksLikeManagementIdentifier(value) {
   return /^LD[-_/]?EQ[0-9A-Z-]{2,}$/i.test(normalized);
 }
 
-function looksLikeCertificateIdentifier(value) {
+function matchesCertificateIdentifierPattern(identifier) {
+  return /^[A-Z]\d{4}(?:\d|[A-Z]\d{2})-(?:\d{7}|[A-Z]\d{6})$/i.test(identifier);
+}
+
+function normalizeCertificateIdentifierArtifacts(value) {
   const identifier = extractBestStructuredIdentifier(value);
+  if (!identifier) {
+    return "";
+  }
+
+  const variants = new Set([identifier]);
+  if (/^[2L]/i.test(identifier)) {
+    variants.add(`Z${identifier.slice(1)}`);
+  }
+
+  [...variants].forEach((candidate) => {
+    const shortened = candidate.replace(/^([A-Z]\d{4}(?:\d|[A-Z]\d{2})-)([A-Z])\d(\d{6})$/i, "$1$2$3");
+    if (shortened !== candidate) {
+      variants.add(shortened);
+    }
+  });
+
+  return [...variants].find((candidate) => matchesCertificateIdentifierPattern(candidate)) || identifier;
+}
+
+function looksLikeCertificateIdentifier(value) {
+  const identifier = normalizeCertificateIdentifierArtifacts(value);
   if (!identifier || looksLikeManagementIdentifier(identifier) || !identifier.includes("-")) {
     return false;
   }
 
-  return /^[A-Z]\d{4}(?:[A-Z]\d{2})?-(?:\d{7}|[A-Z]\d{6})$/i.test(identifier);
+  return matchesCertificateIdentifierPattern(identifier);
 }
 
 function extractBestModelValue(value) {
@@ -1495,7 +1539,7 @@ function getRegionSourceCanvases(field, thresholdedCanvas, rawCanvas) {
   const preferredCanvas = regionHint.useThresholded ? thresholdedCanvas : (rawCanvas || thresholdedCanvas);
   const alternateCanvas = regionHint.useThresholded ? (rawCanvas || null) : thresholdedCanvas;
   const canvases = [preferredCanvas];
-  if (alternateCanvas && alternateCanvas !== preferredCanvas) {
+  if (regionHint.allowAlternateCanvas !== false && alternateCanvas && alternateCanvas !== preferredCanvas) {
     canvases.push(alternateCanvas);
   }
   return canvases.filter(Boolean);
@@ -1507,19 +1551,23 @@ async function extractOcrValueFromRegion(canvas, worker, regionHint) {
   }
 
   const cropCanvas = document.createElement("canvas");
+  const scale = Math.max(1, Number(regionHint.scale) || 1);
   const left = Math.floor(canvas.width * regionHint.left);
   const top = Math.floor(canvas.height * regionHint.top);
   const width = Math.floor(canvas.width * regionHint.width);
   const height = Math.floor(canvas.height * regionHint.height);
 
-  cropCanvas.width = width;
-  cropCanvas.height = height;
-  cropCanvas.getContext("2d").drawImage(canvas, left, top, width, height, 0, 0, width, height);
+  cropCanvas.width = Math.max(1, Math.floor(width * scale));
+  cropCanvas.height = Math.max(1, Math.floor(height * scale));
+  const context = cropCanvas.getContext("2d");
+  context.imageSmoothingEnabled = false;
+  context.drawImage(canvas, left, top, width, height, 0, 0, cropCanvas.width, cropCanvas.height);
 
   await worker.setParameters({
     tessedit_pageseg_mode: regionHint.psm || "6",
     preserve_interword_spaces: "1",
     user_defined_dpi: "300",
+    tessedit_char_whitelist: regionHint.whitelist || "",
   });
 
   const result = await worker.recognize(cropCanvas, {}, { text: true });
@@ -1777,7 +1825,7 @@ function normalizeFieldValueForOutput(field, value) {
   nextValue = stripLeadingFieldLabelPrefix(field, nextValue);
 
   if (fieldKey === normalizeFieldLabel("证书编号")) {
-    const identifier = extractBestStructuredIdentifier(nextValue);
+    const identifier = normalizeCertificateIdentifierArtifacts(nextValue);
     if (identifier) {
       return identifier;
     }
@@ -1849,11 +1897,13 @@ function scoreFieldCandidate(field, value, options = {}) {
   let score = normalized.length * 2 + (options.sourceBonus || 0);
 
   if (fieldKey === normalizeFieldLabel("证书编号")) {
-    const identifier = extractBestStructuredIdentifier(normalized);
+    const identifier = normalizeCertificateIdentifierArtifacts(normalized);
     if (!identifier || looksLikeManagementIdentifier(identifier)) {
       return -Infinity;
     }
     const suffix = identifier.split("-").pop() || "";
+    const hasLetterDigitSuffix = /^[A-Z]\d{6}$/i.test(suffix);
+    const hasDigitOnlySuffix = /^\d{7}$/.test(suffix);
 
     score += digitCount * 6;
     score += upperCount * 4;
@@ -1869,6 +1919,11 @@ function scoreFieldCandidate(field, value, options = {}) {
     }
     if (/^Z/i.test(identifier)) {
       score += 40;
+    }
+    if (hasLetterDigitSuffix) {
+      score += 24;
+    } else if (hasDigitOnlySuffix) {
+      score += 8;
     }
     if (identifier.includes("-") && !/^(?:\d{7}|[A-Z]\d{6})$/i.test(suffix)) {
       score -= 140;
@@ -1984,11 +2039,18 @@ function scoreFieldCandidate(field, value, options = {}) {
       return -Infinity;
     }
 
+    const suspiciousSymbolCount = countPatternMatches(normalized, /[=|｜_`~]/g);
+    const quoteCount = countPatternMatches(normalized, /["'“”‘’]/g);
     score += cjkCount * 14;
     score -= latinCount * 6;
     score -= digitCount * 10;
+    score -= suspiciousSymbolCount * 36;
+    score -= quoteCount * 14;
     if (normalized.length <= 8 && digitCount === 0) {
       score += 140;
+    }
+    if (hasExplicitFieldTextPrefix(originalText, field)) {
+      score += 28;
     }
     if (/日期|Date|编号|No\.?|地址|Address|Model|Type|规格|管理|校准|证书/i.test(originalText) && !matchesFieldLabelText(originalText, field)) {
       return -Infinity;
@@ -2291,7 +2353,7 @@ async function extractPdfTextWithOcr(file, fields = state.fields) {
     const page = await pdf.getPage(pageNumber);
     const canvas = await renderPdfPageToCanvas(page, 3, 180);
     const rawCanvas = pageNumber === 1 && shouldRenderRawCanvasForFields(fields)
-      ? await renderPdfPageToCanvas(page, 4, 0)
+      ? await renderPdfPageToCanvas(page, 3, 0)
       : null;
     const regionFirst = await buildPreciseRegionStructuredText(canvas, rawCanvas, worker, fields, pageNumber);
     const regionStructuredText = normalizeExtractedText(regionFirst.text);

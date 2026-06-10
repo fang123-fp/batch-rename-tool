@@ -77,6 +77,35 @@ const CERTIFICATE_TEMPLATE_FIELDS = new Set([
   normalizeFieldLabel("地址"),
   normalizeFieldLabel("管理编号"),
   normalizeFieldLabel("仪器名称"),
+  normalizeFieldLabel("制造厂家"),
+  normalizeFieldLabel("制造厂商"),
+  normalizeFieldLabel("制造商"),
+  normalizeFieldLabel("生产厂家"),
+]);
+const MANUFACTURER_NOISE_WORDS = new Set([
+  "model",
+  "type",
+  "manufacturer",
+  "ufacturer",
+  "facturer",
+  "certificate",
+  "calibration",
+  "client",
+  "name",
+  "address",
+  "description",
+  "serial",
+  "number",
+  "management",
+  "receipt",
+  "issue",
+  "due",
+  "page",
+  "approved",
+  "inspected",
+  "calibrated",
+  "stamp",
+  "thermofisher",
 ]);
 const GENERIC_FIELD_SUFFIXES = [
   "号",
@@ -137,7 +166,7 @@ let tesseractLoadPromise;
 let ocrQueueTail = Promise.resolve();
 let activeOcrJobCount = 0;
 let waitingOcrJobCount = 0;
-const STATIC_ASSET_VERSION = "20260610-certlock1";
+const STATIC_ASSET_VERSION = "20260610-certlock2";
 
 function resolveAssetUrl(relativePath, options = {}) {
   const { versioned = true } = options;
@@ -1285,13 +1314,37 @@ function extractBestManufacturerValue(value) {
     return normalizeWhitespace(englishCompany[0]);
   }
 
-  const afterManufacture = normalized.replace(/^.*?制造[|｜/\\\s:：]*/i, "").trim();
+  const hasManufactureAnchor = /制造|厂商|厂家|Manufacturer|ufacturer|facturer/i.test(normalized);
+  const afterManufacture = hasManufactureAnchor
+    ? normalized.replace(/^.*?(?:制造(?:厂家|厂商|商)?|Manufacturer|ufacturer|facturer)\s*[：:|｜/\\\s-]*/i, "").trim()
+    : "";
   if (!afterManufacture) {
-    return "";
+    const standaloneBrand = extractManufacturerBrandToken(normalized);
+    return standaloneBrand || "";
   }
 
   const fallbackEnglish = afterManufacture.match(/[A-Z][A-Za-z0-9&().,\- ]{2,}/);
-  return fallbackEnglish ? normalizeWhitespace(fallbackEnglish[0]) : "";
+  if (fallbackEnglish) {
+    return normalizeWhitespace(fallbackEnglish[0]);
+  }
+
+  return extractManufacturerBrandToken(afterManufacture) || extractManufacturerBrandToken(normalized) || "";
+}
+
+function extractManufacturerBrandToken(value) {
+  const normalized = normalizeWhitespace(value || "");
+  if (!normalized) {
+    return "";
+  }
+
+  const stripped = normalized
+    .replace(/^.*?(?:制造(?:厂家|厂商|商)?|Manufacturer|ufacturer|facturer)\s*[：:|｜/\\\s-]*/i, "")
+    .trim();
+  const englishTokens = (stripped.match(/[A-Za-z][A-Za-z0-9._-]{2,}/g) || [])
+    .filter((token) => token.length >= 4)
+    .filter((token) => !MANUFACTURER_NOISE_WORDS.has(token.toLowerCase()));
+
+  return englishTokens.length ? englishTokens[englishTokens.length - 1] : "";
 }
 
 function hasConflictingDateLabel(value, fieldKey) {
@@ -2227,12 +2280,33 @@ function scoreFieldCandidate(field, value, options = {}) {
       return -Infinity;
     }
 
+    if (MANUFACTURER_NOISE_WORDS.has(manufacturerValue.toLowerCase())) {
+      return -Infinity;
+    }
+
     score += countKeywordHits(manufacturerValue, COMPANY_NAME_HINTS) * 60;
     if (/[A-Za-z]/.test(manufacturerValue)) {
       score += 40;
     }
-    if (/型号|规格|日期|编号|Address|地址/i.test(originalText) && !matchesFieldLabelText(originalText, field)) {
-      score -= 80;
+    if (/^[A-Za-z][A-Za-z0-9._-]{3,}$/.test(manufacturerValue)) {
+      score += 70;
+    }
+
+    const hasManufacturerAnchor = /制造|厂商|厂家|Manufacturer|ufacturer|facturer/i.test(originalText);
+    if (hasManufacturerAnchor) {
+      score += 120;
+    }
+
+    if (/Calibration|Certificate|Client|Address|Description|Serial|Management|Page|Date|Issue|Receipt|Due/i.test(originalText) && !hasManufacturerAnchor) {
+      return -Infinity;
+    }
+
+    if (/型号|规格|Model|Type/i.test(originalText) && !hasManufacturerAnchor && !/[A-Za-z]{4,}/.test(manufacturerValue)) {
+      return -Infinity;
+    }
+
+    if (/型号|规格|日期|编号|Address|地址/i.test(originalText) && !hasManufacturerAnchor && !matchesFieldLabelText(originalText, field)) {
+      score -= 120;
     }
     return score;
   }
@@ -2375,7 +2449,54 @@ function collectStrictTemplateIdentifierCandidates(text, field) {
   return candidates;
 }
 
+function collectCertificateManufacturerCandidates(text, field, source = "text", sourceBonusOffset = 0) {
+  const lines = normalizeExtractedText(text || "")
+    .split(/\r?\n/)
+    .map((line) => normalizeWhitespace(line))
+    .filter(Boolean);
+  const candidates = [];
+  const seen = new Set();
+
+  const pushCandidate = (value, rawValue, sourceBonus) => {
+    const normalized = normalizeFieldValueForOutput(field, value);
+    if (!normalized || seen.has(normalized)) {
+      return;
+    }
+    seen.add(normalized);
+    candidates.push({
+      value: normalized,
+      rawValue,
+      source,
+      sourceBonus: sourceBonus + sourceBonusOffset,
+    });
+  };
+
+  lines.forEach((line, index) => {
+    const hasManufacturerAnchor = /制造|厂商|厂家|Manufacturer|ufacturer|facturer/i.test(line);
+    const hasModelRowAnchor = /型号|规格|Model\/Type|Model|Type/i.test(line);
+
+    if (matchesFieldLabelText(line, field) && lines[index + 1]) {
+      pushCandidate(lines[index + 1], `${line}\n${lines[index + 1]}`, 30);
+    }
+
+    if (!hasManufacturerAnchor && !hasModelRowAnchor) {
+      return;
+    }
+
+    const brand = extractBestManufacturerValue(line);
+    if (!brand) {
+      return;
+    }
+    pushCandidate(brand, line, hasManufacturerAnchor ? 34 : 22);
+  });
+
+  return candidates;
+}
+
 function collectCertificateTemplateFieldCandidates(text, field, source = "text", sourceBonusOffset = 0) {
+  const manufacturerCandidates = isManufacturerFieldKey(normalizeFieldLabel(field))
+    ? collectCertificateManufacturerCandidates(text, field, source, sourceBonusOffset)
+    : [];
   const explicitCandidates = collectFieldCandidatesFromLines(text, field).map((candidate) => ({
     ...candidate,
     source,
@@ -2387,7 +2508,7 @@ function collectCertificateTemplateFieldCandidates(text, field, source = "text",
     sourceBonus: (candidate.sourceBonus || 0) + sourceBonusOffset,
   }));
 
-  return [...explicitCandidates, ...strictIdentifierCandidates];
+  return [...explicitCandidates, ...strictIdentifierCandidates, ...manufacturerCandidates];
 }
 
 function summarizeFieldCandidatesForDiagnostics(field, candidates = []) {
@@ -2451,16 +2572,21 @@ function selectCertificateTemplateFieldValue(field, candidates = []) {
     return "";
   }
 
-  if (
-    fieldKey === normalizeFieldLabel("证书编号")
-    || fieldKey === normalizeFieldLabel("管理编号")
-  ) {
+  if (fieldKey === normalizeFieldLabel("证书编号")) {
+    const strongStructuredCandidate = ranked.find((candidate) => (
+      candidate.source === "structured"
+      && looksLikeCertificateIdentifier(candidate.value)
+      && candidate.score >= getStrongFieldScoreThreshold(field)
+    ));
+    if (strongStructuredCandidate) {
+      return strongStructuredCandidate.value;
+    }
+  }
+
+  if (fieldKey === normalizeFieldLabel("管理编号")) {
     const strongRawCandidate = ranked.find((candidate) => {
       if (candidate.source !== "raw") {
         return false;
-      }
-      if (fieldKey === normalizeFieldLabel("证书编号")) {
-        return looksLikeCertificateIdentifier(candidate.value) && candidate.score >= 420;
       }
       return looksLikeManagementIdentifier(candidate.value) && candidate.score >= 300;
     });

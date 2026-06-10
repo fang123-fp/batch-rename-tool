@@ -116,3 +116,42 @@
   - `规格型号` => `(0~60) Pa/2Pa`
   - `出厂编号` => `LD-EQ065-43`
   - `生产厂家` => `Duwei Instruments Ltd.`
+
+## 2026-06-10 Batch OCR Queue Fix
+- 已修复“批量上传多份扫描 PDF 时，OCR 并发互相阻塞，导致大部分文件一直取不到值”的问题
+- 根因是整批文件通过 `Promise.all` 同时进入 OCR，而页面只复用了一个 Tesseract worker；多份扫描件会并发调用同一个 worker，结果出现长时间卡住
+- 本次改动包括：
+  - 为 OCR 增加串行队列，同一时刻只让一个扫描任务占用 worker
+  - 只对当前仍缺失的字段做 OCR，避免无效识别
+  - 每完成一页 OCR 就立即检查字段是否已补齐，补齐后提前停止后续页识别
+  - 批量处理中按文件逐个刷新状态，排队中会显示前方等待数量
+- 已同步将静态资源版本号提升为 `20260610-batchocr1`，避免访问页继续命中旧缓存
+
+## 2026-06-10 Batch OCR Queue Verification
+- 用真实页面批量上传以下 6 份用户样本回归：
+  - `/Users/fangpei/Desktop/导出内容资料/页面提取自－SCAN0002-2.pdf`
+  - `/Users/fangpei/Desktop/导出内容资料/页面提取自－SCAN0002-3.pdf`
+  - `/Users/fangpei/Desktop/导出内容资料/页面提取自－SCAN0002-4.pdf`
+  - `/Users/fangpei/Desktop/导出内容资料/页面提取自－SCAN0002-5.pdf`
+  - `/Users/fangpei/Desktop/导出内容资料/页面提取自－SCAN0002-6.pdf`
+  - `/Users/fangpei/Desktop/导出内容资料/页面提取自－SCAN0002-7.pdf`
+- 修复前：`240s` 仍有 `5/6` 文件卡在“准备 OCR”，只有 1 份完成
+- 修复后：同一批文件约 `24s` 全部完成，且 `6/6` 文件都成功匹配 `证书编号 + 客户名称`
+- 同时回归 `/Users/fangpei/Desktop/导出内容资料/SCAN0000 1.pdf`，`13/13` 字段结果保持正确，耗时约 `5s`
+
+## 2026-06-10 First Page Only Optimization
+- 已按当前证书样本特征，将 PDF 文字提取和 OCR 识别都收敛为“只读取第一页”
+- 这样可以避免多页 PDF 在后续页面上继续做无效解析，进一步缩短批量处理耗时
+- 已同步将静态资源版本号提升为 `20260610-firstpage1`，避免访问页继续命中旧缓存
+
+## 2026-06-10 First Page Only Verification
+- 用真实页面再次回归以下 6 份样本：
+  - `/Users/fangpei/Desktop/导出内容资料/页面提取自－SCAN0002-2.pdf`
+  - `/Users/fangpei/Desktop/导出内容资料/页面提取自－SCAN0002-3.pdf`
+  - `/Users/fangpei/Desktop/导出内容资料/页面提取自－SCAN0002-4.pdf`
+  - `/Users/fangpei/Desktop/导出内容资料/页面提取自－SCAN0002-5.pdf`
+  - `/Users/fangpei/Desktop/导出内容资料/页面提取自－SCAN0002-6.pdf`
+  - `/Users/fangpei/Desktop/导出内容资料/页面提取自－SCAN0002-7.pdf`
+- `6/6` 文件仍然成功匹配 `证书编号 + 客户名称`
+- 总耗时约 `24s`，与上一版批量回归接近，说明这批样本上一版已基本在第一页就完成字段命中；本次改动主要是把“只读第一页”规则显式固化
+- 同时回归 `/Users/fangpei/Desktop/导出内容资料/SCAN0000 1.pdf`，`13/13` 字段结果保持正确，耗时约 `5s`

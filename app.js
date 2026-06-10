@@ -14,7 +14,7 @@ const state = {
 
 const TEXT_EXTENSIONS = new Set([".txt", ".csv", ".tsv", ".json", ".md", ".markdown", ".html", ".htm", ".xml"]);
 const FIELD_BOUNDARY_PREFIX = "(?:\\n\\s*|[\\s,，;；]+)";
-const OCR_MAX_PDF_PAGES = 3;
+const PDF_MAX_PAGES_TO_READ = 1;
 const KNOWN_PDF_FIELD_REGION_HINTS = {
   [normalizeFieldLabel("证书编号")]: { left: 0.19, top: 0.165, width: 0.16, height: 0.028, psm: "7", useThresholded: true },
   [normalizeFieldLabel("客户名称")]: { left: 0.18, top: 0.18, width: 0.70, height: 0.07, psm: "6" },
@@ -105,7 +105,10 @@ const resetTemplateBtn = document.getElementById("resetTemplateBtn");
 let pdfJsLibPromise;
 let ocrWorkerPromise;
 let tesseractLoadPromise;
-const STATIC_ASSET_VERSION = "20260609-fieldfix1";
+let ocrQueueTail = Promise.resolve();
+let activeOcrJobCount = 0;
+let waitingOcrJobCount = 0;
+const STATIC_ASSET_VERSION = "20260610-firstpage1";
 
 function resolveAssetUrl(relativePath, options = {}) {
   const { versioned = true } = options;
@@ -521,9 +524,55 @@ function getFilledFieldCount(record) {
   return state.fields.filter((field) => normalizeWhitespace(record.values[field] || "")).length;
 }
 
+function getMissingFieldList(record) {
+  return state.fields.filter((field) => !normalizeWhitespace(record.values[field] || ""));
+}
+
+function countMatchedFieldsInText(text, fields = state.fields) {
+  const source = normalizeExtractedText(text || "");
+  if (!source || !fields.length) {
+    return 0;
+  }
+
+  let matchedCount = 0;
+  fields.forEach((field) => {
+    if (extractFieldValueFromText(source, field)) {
+      matchedCount += 1;
+    }
+  });
+  return matchedCount;
+}
+
+function buildQueuedOcrMessage(queuePosition) {
+  if (queuePosition > 0) {
+    return `扫描版 PDF 较多，当前文件排队识别中（前面还有 ${queuePosition} 个）...`;
+  }
+  return "正在识别扫描版 PDF，可能需要 1 分钟左右...";
+}
+
+function enqueueOcrTask(task) {
+  const queuePosition = activeOcrJobCount + waitingOcrJobCount;
+  waitingOcrJobCount += 1;
+
+  const scheduled = ocrQueueTail
+    .catch(() => {})
+    .then(async () => {
+      waitingOcrJobCount = Math.max(0, waitingOcrJobCount - 1);
+      activeOcrJobCount += 1;
+      try {
+        return await task();
+      } finally {
+        activeOcrJobCount = Math.max(0, activeOcrJobCount - 1);
+      }
+    });
+
+  ocrQueueTail = scheduled.catch(() => {});
+  return { queuePosition, promise: scheduled };
+}
+
 function buildExtractionMessage(record) {
   if (record.contentState === "reading") {
-    return "正在读取文件内容...";
+    return record.contentMessage || "正在读取文件内容...";
   }
   if (record.contentState === "unsupported") {
     return record.contentMessage || "当前文件类型暂不支持自动读取";
@@ -1888,7 +1937,8 @@ async function extractPdfText(file) {
   const documentTask = pdfjsLib.getDocument({ data: new Uint8Array(await file.arrayBuffer()) });
   const pdf = await documentTask.promise;
   const chunks = [];
-  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+  const pageCount = Math.min(pdf.numPages, PDF_MAX_PAGES_TO_READ);
+  for (let pageNumber = 1; pageNumber <= pageCount; pageNumber += 1) {
     const page = await pdf.getPage(pageNumber);
     const textContent = await page.getTextContent();
     const lines = [];
@@ -1938,7 +1988,7 @@ async function extractPdfTextWithOcr(file, fields = state.fields) {
   const documentTask = pdfjsLib.getDocument({ data: new Uint8Array(await file.arrayBuffer()) });
   const pdf = await documentTask.promise;
   const worker = await getOcrWorker();
-  const pageCount = Math.min(pdf.numPages, OCR_MAX_PDF_PAGES);
+  const pageCount = Math.min(pdf.numPages, PDF_MAX_PAGES_TO_READ);
   const chunks = [];
 
   for (let pageNumber = 1; pageNumber <= pageCount; pageNumber += 1) {
@@ -1960,6 +2010,9 @@ async function extractPdfTextWithOcr(file, fields = state.fields) {
 
     if (pageText) {
       chunks.push(pageText);
+      if (fields.length && countMatchedFieldsInText(chunks.join("\n\n"), fields) >= fields.length) {
+        break;
+      }
     }
   }
 
@@ -2046,19 +2099,29 @@ async function populateRecordFromContent(record, options = {}) {
       record.contentState = result.state;
       record.contentMessage = result.message;
       record.contentTypeLabel = result.typeLabel;
-  }
+    }
 
-  if (record.contentState === "ready") {
-    syncValuesFromContent(record);
+    if (record.contentState === "ready") {
+      syncValuesFromContent(record);
+      const missingFields = getMissingFieldList(record);
 
       if (
         record.extensionLower === ".pdf"
         && !record.ocrAttempted
-        && getFilledFieldCount(record) < state.fields.length
+        && missingFields.length
       ) {
-        record.contentMessage = "正在尝试识别扫描版 PDF，可能需要 1 分钟左右...";
-        const ocrText = await extractPdfTextWithOcr(record.file, state.fields);
+        const queuedTask = enqueueOcrTask(async () => {
+          record.contentState = "reading";
+          record.contentMessage = "正在识别扫描版 PDF，可能需要 1 分钟左右...";
+          renderDataViews();
+          return extractPdfTextWithOcr(record.file, missingFields);
+        });
+        record.contentState = "reading";
+        record.contentMessage = buildQueuedOcrMessage(queuedTask.queuePosition);
+        renderDataViews();
+        const ocrText = await queuedTask.promise;
         record.ocrAttempted = true;
+        record.contentState = "ready";
 
         if (normalizeExtractedText(ocrText)) {
           record.contentText = normalizeExtractedText(`${ocrText}\n${record.contentText}`);
@@ -2100,7 +2163,12 @@ async function runAutoExtraction(records = state.files, options = {}) {
   });
   renderDataViews();
 
-  await Promise.all(records.map((record) => populateRecordFromContent(record, options)));
+  await Promise.all(records.map(async (record) => {
+    await populateRecordFromContent(record, options);
+    if (runId === state.extractionRunId) {
+      renderDataViews();
+    }
+  }));
 
   if (runId !== state.extractionRunId) {
     return;

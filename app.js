@@ -108,7 +108,7 @@ let tesseractLoadPromise;
 let ocrQueueTail = Promise.resolve();
 let activeOcrJobCount = 0;
 let waitingOcrJobCount = 0;
-const STATIC_ASSET_VERSION = "20260610-rereadguard1";
+const STATIC_ASSET_VERSION = "20260610-certguard1";
 
 function resolveAssetUrl(relativePath, options = {}) {
   const { versioned = true } = options;
@@ -937,6 +937,21 @@ function compactChineseValue(value) {
     .replace(/([0-9A-Za-z）)])\s+(?=[\u3400-\u9fff])/g, "$1");
 }
 
+function stripLeadingFieldLabelPrefix(field, value) {
+  let nextValue = normalizeWhitespace(value || "");
+  if (!nextValue) {
+    return "";
+  }
+
+  const patterns = getFlexibleFieldPatterns(field);
+  if (!patterns.length) {
+    return nextValue;
+  }
+
+  const prefixPattern = new RegExp(`^(?:${patterns.join("|")})\\s*[：:]?\\s*`, "i");
+  return nextValue.replace(prefixPattern, "").trim();
+}
+
 function extractBestStructuredIdentifier(value) {
   const compact = normalizeWhitespace(value || "").replace(/\s+/g, "");
   const matches = compact.match(/[A-Za-z]?\d[\dA-Za-z._/#()（）+-]{5,}/g) || [];
@@ -1043,7 +1058,7 @@ function looksLikeCertificateIdentifier(value) {
     return false;
   }
 
-  return /^[A-Z]\d{4}[A-Z0-9-]{6,}$/i.test(identifier);
+  return /^[A-Z]\d{4}(?:[A-Z]\d{2})?-(?:\d{7}|[A-Z]\d{6})$/i.test(identifier);
 }
 
 function extractBestModelValue(value) {
@@ -1759,6 +1774,8 @@ function normalizeFieldValueForOutput(field, value) {
   let nextValue = cleanExtractedValue(String(value || ""));
   const fieldKey = normalizeFieldLabel(field);
 
+  nextValue = stripLeadingFieldLabelPrefix(field, nextValue);
+
   if (fieldKey === normalizeFieldLabel("证书编号")) {
     const identifier = extractBestStructuredIdentifier(nextValue);
     if (identifier) {
@@ -1836,6 +1853,7 @@ function scoreFieldCandidate(field, value, options = {}) {
     if (!identifier || looksLikeManagementIdentifier(identifier)) {
       return -Infinity;
     }
+    const suffix = identifier.split("-").pop() || "";
 
     score += digitCount * 6;
     score += upperCount * 4;
@@ -1851,6 +1869,9 @@ function scoreFieldCandidate(field, value, options = {}) {
     }
     if (/^Z/i.test(identifier)) {
       score += 40;
+    }
+    if (identifier.includes("-") && !/^(?:\d{7}|[A-Z]\d{6})$/i.test(suffix)) {
+      score -= 140;
     }
     if (/[A-Za-z]/.test(identifier.slice(1)) && !looksLikeCertificateIdentifier(identifier)) {
       score -= 80;

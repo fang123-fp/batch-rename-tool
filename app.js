@@ -108,7 +108,7 @@ let tesseractLoadPromise;
 let ocrQueueTail = Promise.resolve();
 let activeOcrJobCount = 0;
 let waitingOcrJobCount = 0;
-const STATIC_ASSET_VERSION = "20260610-precisefast2";
+const STATIC_ASSET_VERSION = "20260610-fieldfix1";
 
 function resolveAssetUrl(relativePath, options = {}) {
   const { versioned = true } = options;
@@ -909,6 +909,20 @@ function extractBestStructuredIdentifier(value) {
   return matches.sort((left, right) => right.length - left.length)[0] || "";
 }
 
+function extractIdentifierLikeCandidates(value) {
+  const compact = normalizeWhitespace(value || "").replace(/\s+/g, "");
+  if (!compact) {
+    return [];
+  }
+
+  const matches = [
+    ...(compact.match(/[A-Za-z0-9]+(?:[-_/][A-Za-z0-9]+){1,5}/g) || []),
+    ...(compact.match(/[A-Za-z]{0,6}\d[A-Za-z0-9._/#()（）+-]{4,}/g) || []),
+  ];
+
+  return [...new Set(matches)];
+}
+
 function countPatternMatches(value, pattern) {
   return (String(value || "").match(pattern) || []).length;
 }
@@ -935,6 +949,10 @@ function isManufacturerFieldKey(fieldKey) {
 
 function isGenericIdentifierFieldKey(fieldKey) {
   return fieldKey.includes(normalizeFieldLabel("编号")) && fieldKey !== normalizeFieldLabel("证书编号");
+}
+
+function isManagementIdentifierFieldKey(fieldKey) {
+  return fieldKey === normalizeFieldLabel("管理编号");
 }
 
 function normalizeDateArtifacts(value) {
@@ -975,14 +993,23 @@ function extractBestGenericIdentifier(value) {
     return "";
   }
 
-  const matches = [
-    ...(compact.match(/[A-Za-z0-9]+(?:[-_/][A-Za-z0-9]+){1,5}/g) || []),
-    ...(compact.match(/[A-Za-z]{0,6}\d[A-Za-z0-9._/#()（）+-]{4,}/g) || []),
-  ];
-
-  return [...new Set(matches)]
+  return extractIdentifierLikeCandidates(compact)
     .filter((candidate) => /\d/.test(candidate))
     .sort((left, right) => right.length - left.length)[0] || "";
+}
+
+function looksLikeManagementIdentifier(value) {
+  const normalized = normalizeWhitespace(value || "").replace(/\s+/g, "");
+  return /^LD[-_/]?EQ[0-9A-Z-]{2,}$/i.test(normalized);
+}
+
+function looksLikeCertificateIdentifier(value) {
+  const identifier = extractBestStructuredIdentifier(value);
+  if (!identifier || looksLikeManagementIdentifier(identifier) || !identifier.includes("-")) {
+    return false;
+  }
+
+  return /^[A-Z]\d{4}[A-Z0-9-]{6,}$/i.test(identifier);
 }
 
 function extractBestModelValue(value) {
@@ -1542,12 +1569,12 @@ async function buildStructuredTextFromOcrPage(canvas, rawCanvas, worker, lines, 
     if (labelLine) {
       const inlineValue = extractInlineFieldValue(labelLine.text, field);
       if (inlineValue) {
-        candidates.push({ value: inlineValue, sourceBonus: 18 });
+        candidates.push({ value: inlineValue, rawValue: labelLine.text, sourceBonus: 18 });
       }
 
       const nearbyValue = normalizeFieldValueForOutput(field, stripTrailingPaginationArtifacts(pickBestOcrValueCandidate(labelLine, lines, field)));
       if (isUsableExtractedValue(nearbyValue, field)) {
-        candidates.push({ value: nearbyValue, sourceBonus: 14 });
+        candidates.push({ value: nearbyValue, rawValue: labelLine.text, sourceBonus: 14 });
       }
 
       const quickValue = selectBestFieldCandidate(field, candidates);
@@ -1558,7 +1585,7 @@ async function buildStructuredTextFromOcrPage(canvas, rawCanvas, worker, lines, 
 
       const cropValue = normalizeFieldValueForOutput(field, await extractOcrValueByCrop(canvas, worker, labelLine));
       if (isUsableExtractedValue(cropValue, field)) {
-        candidates.push({ value: cropValue, sourceBonus: 10 });
+        candidates.push({ value: cropValue, rawValue: labelLine.text, sourceBonus: 10 });
       }
     }
 
@@ -1566,7 +1593,7 @@ async function buildStructuredTextFromOcrPage(canvas, rawCanvas, worker, lines, 
       const sourceCanvas = regionHint.useThresholded ? canvas : (rawCanvas || canvas);
       const regionValue = normalizeFieldValueForOutput(field, await extractOcrValueFromRegion(sourceCanvas, worker, regionHint));
       if (isUsableExtractedValue(regionValue, field)) {
-        candidates.push({ value: regionValue, sourceBonus: 16 });
+        candidates.push({ value: regionValue, rawValue: field, sourceBonus: 16 });
       }
     }
 
@@ -1772,13 +1799,13 @@ function scoreFieldCandidate(field, value, options = {}) {
 
   if (fieldKey === normalizeFieldLabel("证书编号")) {
     const identifier = extractBestStructuredIdentifier(normalized);
-    if (!identifier) {
+    if (!identifier || looksLikeManagementIdentifier(identifier)) {
       return -Infinity;
     }
 
     score += digitCount * 6;
     score += upperCount * 4;
-    if (/^[A-Z]\d{4,}-\d{4,}$/.test(identifier)) {
+    if (looksLikeCertificateIdentifier(identifier)) {
       score += 220;
     } else if (/^\d{4,}-\d{4,}$/.test(identifier)) {
       score += 150;
@@ -1788,11 +1815,11 @@ function scoreFieldCandidate(field, value, options = {}) {
     if (identifier.includes("-")) {
       score += 30;
     }
-    if (/[A-Za-z]/.test(identifier.slice(1))) {
-      score -= 80;
+    if (/^Z/i.test(identifier)) {
+      score += 40;
     }
-    if (/LD|EQ/i.test(identifier)) {
-      score -= 120;
+    if (/[A-Za-z]/.test(identifier.slice(1)) && !looksLikeCertificateIdentifier(identifier)) {
+      score -= 80;
     }
     return score;
   }
@@ -1810,6 +1837,17 @@ function scoreFieldCandidate(field, value, options = {}) {
     }
     if (/[A-Za-z]/.test(identifier) && /\d/.test(identifier)) {
       score += 80;
+    }
+    if (isManagementIdentifierFieldKey(fieldKey)) {
+      if (looksLikeCertificateIdentifier(identifier)) {
+        return -Infinity;
+      }
+      if (looksLikeManagementIdentifier(identifier)) {
+        score += 240;
+      }
+      if (/管理|Management|LD[-_/]?EQ/i.test(originalText)) {
+        score += 40;
+      }
     }
     if (/日期|Date|地址|Address|名称|Name|客户|Client/i.test(originalText)) {
       score -= 220;
@@ -1841,12 +1879,25 @@ function scoreFieldCandidate(field, value, options = {}) {
       return -Infinity;
     }
 
+    const customerHintHits = countKeywordHits(normalized, CUSTOMER_NAME_HINTS);
+    const companyHintHits = countKeywordHits(normalized, COMPANY_NAME_HINTS);
+    const addressHintHits = countKeywordHits(normalized, ADDRESS_HINTS);
     score += cjkCount * 12;
     score -= latinCount * 8;
     score -= digitCount * 8;
-    score += countKeywordHits(normalized, CUSTOMER_NAME_HINTS) * 40;
+    score += customerHintHits * 40;
+    score += companyHintHits * 24;
+    if (addressHintHits >= 2 && customerHintHits + companyHintHits === 0) {
+      return -Infinity;
+    }
+    if (addressHintHits >= 3) {
+      score -= 160;
+    }
     if (/地址|Address|仪器|Description|型号|规格|证书|编号|Client\s*Name/i.test(normalized)) {
       score -= 120;
+    }
+    if (/地址|Address/i.test(originalText) && !matchesFieldLabelText(originalText, field)) {
+      score -= 220;
     }
     if (latinCount > cjkCount) {
       score -= 60;
@@ -1996,17 +2047,59 @@ function collectFieldCandidatesFromLines(text, field) {
 
       const inlineCandidate = normalizeFieldValueForOutput(field, truncateAtNextField(inlineMatch[1], field));
       if (isUsableExtractedValue(inlineCandidate, field)) {
-        candidates.push({ value: inlineCandidate, sourceBonus: 20 });
+        candidates.push({ value: inlineCandidate, rawValue: line, sourceBonus: 20 });
       }
     }
 
     for (let offset = 1; offset <= 2 && index + offset < lines.length; offset += 1) {
       const candidate = normalizeFieldValueForOutput(field, truncateAtNextField(lines[index + offset], field));
       if (isUsableExtractedValue(candidate, field)) {
-        candidates.push({ value: candidate, sourceBonus: 14 - (offset * 2) });
+        candidates.push({ value: candidate, rawValue: lines[index + offset], sourceBonus: 14 - (offset * 2) });
       }
     }
   }
+
+  return candidates;
+}
+
+function collectLooseIdentifierCandidates(text, field) {
+  const fieldKey = normalizeFieldLabel(field);
+  if (fieldKey !== normalizeFieldLabel("证书编号") && !isGenericIdentifierFieldKey(fieldKey)) {
+    return [];
+  }
+
+  const lines = normalizeExtractedText(text || "")
+    .split(/\r?\n/)
+    .map((line) => normalizeWhitespace(line))
+    .filter(Boolean);
+  const candidates = [];
+  const seen = new Set();
+
+  lines.forEach((line) => {
+    extractIdentifierLikeCandidates(line).forEach((identifier) => {
+      const normalized = normalizeFieldValueForOutput(field, identifier);
+      const dedupeKey = `${fieldKey}::${normalized}::${line}`;
+      if (!normalized || seen.has(dedupeKey)) {
+        return;
+      }
+
+      seen.add(dedupeKey);
+      let sourceBonus = 6;
+      if (matchesFieldLabelText(line, field)) {
+        sourceBonus += 12;
+      }
+      if (fieldKey === normalizeFieldLabel("证书编号") && /(证书|Certificate)/i.test(line)) {
+        sourceBonus += 12;
+      }
+      if (isManagementIdentifierFieldKey(fieldKey) && (/管理|Management|LD[-_/]?EQ/i.test(line) || looksLikeManagementIdentifier(identifier))) {
+        sourceBonus += 24;
+      }
+
+      if (isUsableExtractedValue(normalized, field, { rawValue: line, sourceBonus })) {
+        candidates.push({ value: normalized, rawValue: line, sourceBonus });
+      }
+    });
+  });
 
   return candidates;
 }
@@ -2039,12 +2132,13 @@ function extractFieldValueFromText(text, field) {
 
       const candidate = normalizeFieldValueForOutput(field, truncateAtNextField(match[1], field));
       if (isUsableExtractedValue(candidate, field)) {
-        candidates.push({ value: candidate, sourceBonus: 12 });
+        candidates.push({ value: candidate, rawValue: match[0], sourceBonus: 12 });
       }
     }
   }
 
   candidates.push(...collectFieldCandidatesFromLines(text, field));
+  candidates.push(...collectLooseIdentifierCandidates(text, field));
   return selectBestFieldCandidate(field, candidates);
 }
 

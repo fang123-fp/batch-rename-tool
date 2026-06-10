@@ -108,7 +108,7 @@ let tesseractLoadPromise;
 let ocrQueueTail = Promise.resolve();
 let activeOcrJobCount = 0;
 let waitingOcrJobCount = 0;
-const STATIC_ASSET_VERSION = "20260610-firstpage1";
+const STATIC_ASSET_VERSION = "20260610-precisefast2";
 
 function resolveAssetUrl(relativePath, options = {}) {
   const { versioned = true } = options;
@@ -742,11 +742,17 @@ function makeRecord(file) {
     values,
     autoValues,
     contentText: "",
+    baseContentText: "",
+    ocrContentText: "",
     contentState: "idle",
     contentMessage: "等待读取文件内容",
     contentTypeLabel: "",
     ocrAttempted: false,
   };
+}
+
+function updateRecordContentText(record) {
+  record.contentText = normalizeExtractedText([record.ocrContentText, record.baseContentText].filter(Boolean).join("\n"));
 }
 
 function addFiles(fileList) {
@@ -1363,6 +1369,62 @@ function getKnownPdfFieldRegionHint(field) {
   return KNOWN_PDF_FIELD_REGION_HINTS[normalizeFieldLabel(field)] || null;
 }
 
+function shouldRenderRawCanvasForFields(fields = []) {
+  return fields.some((field) => {
+    const regionHint = getKnownPdfFieldRegionHint(field);
+    return regionHint && !regionHint.useThresholded;
+  });
+}
+
+function getStrongFieldScoreThreshold(field) {
+  const fieldKey = normalizeFieldLabel(field);
+  if (fieldKey === normalizeFieldLabel("证书编号")) {
+    return 180;
+  }
+  if (isGenericIdentifierFieldKey(fieldKey)) {
+    return 140;
+  }
+  if (fieldKey === normalizeFieldLabel("客户名称")) {
+    return 140;
+  }
+  if (fieldKey === normalizeFieldLabel("地址")) {
+    return 120;
+  }
+  if (isDateFieldKey(fieldKey)) {
+    return 100;
+  }
+  if (isNameLikeFieldKey(fieldKey)) {
+    return 100;
+  }
+  if (isManufacturerFieldKey(fieldKey)) {
+    return 90;
+  }
+  if (isModelFieldKey(fieldKey)) {
+    return 80;
+  }
+  return 60;
+}
+
+function isStrongExtractedValue(field, value, options = {}) {
+  const score = scoreFieldCandidate(field, value, options);
+  return Number.isFinite(score) && score >= getStrongFieldScoreThreshold(field);
+}
+
+function getRegionSourceCanvases(field, thresholdedCanvas, rawCanvas) {
+  const regionHint = getKnownPdfFieldRegionHint(field);
+  if (!regionHint || !thresholdedCanvas) {
+    return [];
+  }
+
+  const preferredCanvas = regionHint.useThresholded ? thresholdedCanvas : (rawCanvas || thresholdedCanvas);
+  const alternateCanvas = regionHint.useThresholded ? (rawCanvas || null) : thresholdedCanvas;
+  const canvases = [preferredCanvas];
+  if (alternateCanvas && alternateCanvas !== preferredCanvas) {
+    canvases.push(alternateCanvas);
+  }
+  return canvases.filter(Boolean);
+}
+
 async function extractOcrValueFromRegion(canvas, worker, regionHint) {
   if (!canvas || !regionHint) {
     return "";
@@ -1388,6 +1450,85 @@ async function extractOcrValueFromRegion(canvas, worker, regionHint) {
   return cleanExtractedValue(pickBestOcrTextLine(result?.data?.text || ""));
 }
 
+async function extractStrongRegionFieldValue(field, thresholdedCanvas, rawCanvas, worker) {
+  const regionHint = getKnownPdfFieldRegionHint(field);
+  if (!regionHint) {
+    return "";
+  }
+
+  const candidates = [];
+  const seenValues = new Set();
+  const canvases = getRegionSourceCanvases(field, thresholdedCanvas, rawCanvas);
+
+  for (let index = 0; index < canvases.length; index += 1) {
+    const regionValue = normalizeFieldValueForOutput(field, await extractOcrValueFromRegion(canvases[index], worker, regionHint));
+    if (!isUsableExtractedValue(regionValue, field)) {
+      continue;
+    }
+
+    const normalizedValue = normalizeWhitespace(regionValue);
+    if (seenValues.has(normalizedValue)) {
+      continue;
+    }
+    seenValues.add(normalizedValue);
+    candidates.push({ value: regionValue, sourceBonus: index === 0 ? 22 : 14 });
+  }
+
+  const rankedCandidates = candidates
+    .map((candidate) => ({
+      ...candidate,
+      normalizedValue: normalizeWhitespace(candidate.value),
+      score: scoreFieldCandidate(field, candidate.value, candidate),
+    }))
+    .filter((candidate) => Number.isFinite(candidate.score))
+    .sort((left, right) => right.score - left.score);
+  const selectedCandidate = rankedCandidates[0];
+  if (!selectedCandidate) {
+    return "";
+  }
+
+  if (!isStrongExtractedValue(field, selectedCandidate.value)) {
+    return "";
+  }
+
+  const secondDistinctCandidate = rankedCandidates.find((candidate) => candidate.normalizedValue !== selectedCandidate.normalizedValue);
+  if (secondDistinctCandidate) {
+    const scoreGap = selectedCandidate.score - secondDistinctCandidate.score;
+    const minGap = Math.max(80, Math.floor(getStrongFieldScoreThreshold(field) / 2));
+    if (scoreGap < minGap) {
+      return "";
+    }
+  }
+
+  return selectedCandidate.value;
+}
+
+async function buildPreciseRegionStructuredText(thresholdedCanvas, rawCanvas, worker, fields, pageNumber) {
+  if (pageNumber !== 1 || !fields.length) {
+    return {
+      text: "",
+      unresolvedFields: [...fields],
+    };
+  }
+
+  const results = [];
+  const unresolvedFields = [];
+
+  for (const field of fields) {
+    const strongRegionValue = await extractStrongRegionFieldValue(field, thresholdedCanvas, rawCanvas, worker);
+    if (strongRegionValue) {
+      results.push(`${field}：${strongRegionValue}`);
+    } else {
+      unresolvedFields.push(field);
+    }
+  }
+
+  return {
+    text: results.join("\n"),
+    unresolvedFields,
+  };
+}
+
 async function buildStructuredTextFromOcrPage(canvas, rawCanvas, worker, lines, fields, pageNumber) {
   if (!lines.length || !fields.length) {
     return "";
@@ -1407,6 +1548,12 @@ async function buildStructuredTextFromOcrPage(canvas, rawCanvas, worker, lines, 
       const nearbyValue = normalizeFieldValueForOutput(field, stripTrailingPaginationArtifacts(pickBestOcrValueCandidate(labelLine, lines, field)));
       if (isUsableExtractedValue(nearbyValue, field)) {
         candidates.push({ value: nearbyValue, sourceBonus: 14 });
+      }
+
+      const quickValue = selectBestFieldCandidate(field, candidates);
+      if (isStrongExtractedValue(field, quickValue)) {
+        results.push(`${field}：${quickValue}`);
+        continue;
       }
 
       const cropValue = normalizeFieldValueForOutput(field, await extractOcrValueByCrop(canvas, worker, labelLine));
@@ -1994,7 +2141,19 @@ async function extractPdfTextWithOcr(file, fields = state.fields) {
   for (let pageNumber = 1; pageNumber <= pageCount; pageNumber += 1) {
     const page = await pdf.getPage(pageNumber);
     const canvas = await renderPdfPageToCanvas(page, 3, 180);
-    const rawCanvas = pageNumber === 1 ? await renderPdfPageToCanvas(page, 4, 0) : null;
+    const rawCanvas = pageNumber === 1 && shouldRenderRawCanvasForFields(fields)
+      ? await renderPdfPageToCanvas(page, 4, 0)
+      : null;
+    const regionFirst = await buildPreciseRegionStructuredText(canvas, rawCanvas, worker, fields, pageNumber);
+    const regionStructuredText = normalizeExtractedText(regionFirst.text);
+    const unresolvedFields = regionFirst.unresolvedFields;
+
+    if (!unresolvedFields.length) {
+      if (regionStructuredText) {
+        chunks.push(regionStructuredText);
+      }
+      break;
+    }
 
     await worker.setParameters({
       tessedit_pageseg_mode: "3",
@@ -2005,8 +2164,8 @@ async function extractPdfTextWithOcr(file, fields = state.fields) {
     const result = await worker.recognize(canvas, {}, { tsv: true });
     const rawText = normalizeExtractedText(result?.data?.text || "");
     const ocrLines = parseTesseractTsv(result?.data?.tsv || "");
-    const structuredText = await buildStructuredTextFromOcrPage(canvas, rawCanvas, worker, ocrLines, fields, pageNumber);
-    const pageText = normalizeExtractedText(`${structuredText}\n${rawText}`);
+    const structuredText = await buildStructuredTextFromOcrPage(canvas, rawCanvas, worker, ocrLines, unresolvedFields, pageNumber);
+    const pageText = normalizeExtractedText([regionStructuredText, structuredText, rawText].filter(Boolean).join("\n"));
 
     if (pageText) {
       chunks.push(pageText);
@@ -2095,7 +2254,8 @@ async function populateRecordFromContent(record, options = {}) {
 
     if (reReadContent || !record.contentText || record.contentState === "idle") {
       const result = await readTextFromFile(record);
-      record.contentText = normalizeExtractedText(result.text || "");
+      record.baseContentText = normalizeExtractedText(result.text || "");
+      updateRecordContentText(record);
       record.contentState = result.state;
       record.contentMessage = result.message;
       record.contentTypeLabel = result.typeLabel;
@@ -2124,7 +2284,8 @@ async function populateRecordFromContent(record, options = {}) {
         record.contentState = "ready";
 
         if (normalizeExtractedText(ocrText)) {
-          record.contentText = normalizeExtractedText(`${ocrText}\n${record.contentText}`);
+          record.ocrContentText = normalizeExtractedText(ocrText);
+          updateRecordContentText(record);
           syncValuesFromContent(record);
         }
       }

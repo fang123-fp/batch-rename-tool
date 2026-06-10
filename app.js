@@ -108,7 +108,7 @@ let tesseractLoadPromise;
 let ocrQueueTail = Promise.resolve();
 let activeOcrJobCount = 0;
 let waitingOcrJobCount = 0;
-const STATIC_ASSET_VERSION = "20260610-fieldfix1";
+const STATIC_ASSET_VERSION = "20260610-rereadguard1";
 
 function resolveAssetUrl(relativePath, options = {}) {
   const { versioned = true } = options;
@@ -670,6 +670,8 @@ function renderTable() {
 function updateStatus() {
   const tokens = getTemplateTokens(state.template);
   const missing = getMissingTokens(state.template);
+  reloadExtractBtn.disabled = !state.files.length || state.isExtracting;
+  clearValuesBtn.disabled = !state.files.length || state.isExtracting;
 
   if (!state.files.length) {
     setStatus("请先选择至少一个文件", "warn");
@@ -755,6 +757,33 @@ function updateRecordContentText(record) {
   record.contentText = normalizeExtractedText([record.ocrContentText, record.baseContentText].filter(Boolean).join("\n"));
 }
 
+function buildStructuredFieldLinesFromText(text, fields = state.fields) {
+  const lines = [];
+  fields.forEach((field) => {
+    const value = extractFieldValueFromText(text, field);
+    if (normalizeWhitespace(value)) {
+      lines.push(`${field}：${value}`);
+    }
+  });
+  return lines.join("\n");
+}
+
+function mergeOcrExtractionText(previousText, nextText, fields = state.fields) {
+  const previous = normalizeExtractedText(previousText || "");
+  const next = normalizeExtractedText(nextText || "");
+
+  if (!previous) {
+    return next;
+  }
+
+  if (!next) {
+    return previous;
+  }
+
+  const structuredLines = buildStructuredFieldLinesFromText(`${next}\n${previous}`, fields);
+  return normalizeExtractedText([structuredLines, next].filter(Boolean).join("\n"));
+}
+
 function addFiles(fileList) {
   syncPendingFieldInputs();
   const incoming = Array.from(fileList || []).map(makeRecord);
@@ -773,6 +802,11 @@ function clearFiles() {
 }
 
 function clearFieldValues() {
+  if (state.isExtracting) {
+    setStatus("当前还在识别文件内容，请等待这一轮完成后再清空字段值", "warn");
+    return;
+  }
+
   state.files.forEach((record) => {
     state.fields.forEach((field) => {
       record.values[field] = "";
@@ -2378,7 +2412,7 @@ async function populateRecordFromContent(record, options = {}) {
         record.contentState = "ready";
 
         if (normalizeExtractedText(ocrText)) {
-          record.ocrContentText = normalizeExtractedText(ocrText);
+          record.ocrContentText = mergeOcrExtractionText(record.ocrContentText, ocrText, state.fields);
           updateRecordContentText(record);
           syncValuesFromContent(record);
         }
@@ -2437,6 +2471,10 @@ function refreshAutoExtraction(records = state.files, options = {}) {
   const nextRequest = mergeExtractionRequest(null, records, options);
 
   if (state.isExtracting && state.activeExtractionPromise) {
+    if (nextRequest.options.reReadContent) {
+      setStatus("当前还在识别文件内容，请等待这一轮完成后再重新读取", "warn");
+      return state.activeExtractionPromise;
+    }
     state.pendingExtractionRequest = mergeExtractionRequest(state.pendingExtractionRequest, nextRequest.records, nextRequest.options);
     return state.activeExtractionPromise;
   }

@@ -60,6 +60,24 @@ const DATE_LABEL_GROUPS = [
   { key: normalizeFieldLabel("建议下次校准日期"), patterns: ["建议下次校准日期", "Due Date"] },
   { key: normalizeFieldLabel("发布日期"), patterns: ["发布日期", "Issue Date"] },
 ];
+const CERTIFICATE_TEMPLATE_PROFILE_ID = "calibration-certificate-v1";
+const CERTIFICATE_TEMPLATE_PROFILE_LABEL = "证书第一页锁定模式";
+const CERTIFICATE_TEMPLATE_MARKERS = [
+  "校准证书",
+  "Calibration Certificate",
+  "Certificate No",
+  "Client Name",
+  "Address",
+  "Management No",
+  "管理编号",
+];
+const CERTIFICATE_TEMPLATE_FIELDS = new Set([
+  normalizeFieldLabel("证书编号"),
+  normalizeFieldLabel("客户名称"),
+  normalizeFieldLabel("地址"),
+  normalizeFieldLabel("管理编号"),
+  normalizeFieldLabel("仪器名称"),
+]);
 const GENERIC_FIELD_SUFFIXES = [
   "号",
   "码",
@@ -110,6 +128,8 @@ const addFieldBtn = document.getElementById("addFieldBtn");
 const reloadExtractBtn = document.getElementById("reloadExtractBtn");
 const clearValuesBtn = document.getElementById("clearValuesBtn");
 const resetTemplateBtn = document.getElementById("resetTemplateBtn");
+const exportDiagnosticsBtn = document.getElementById("exportDiagnosticsBtn");
+const appVersionBadge = document.getElementById("appVersionBadge");
 
 let pdfJsLibPromise;
 let ocrWorkerPromise;
@@ -117,7 +137,7 @@ let tesseractLoadPromise;
 let ocrQueueTail = Promise.resolve();
 let activeOcrJobCount = 0;
 let waitingOcrJobCount = 0;
-const STATIC_ASSET_VERSION = "20260610-certregion2";
+const STATIC_ASSET_VERSION = "20260610-certlock1";
 
 function resolveAssetUrl(relativePath, options = {}) {
   const { versioned = true } = options;
@@ -552,6 +572,41 @@ function countMatchedFieldsInText(text, fields = state.fields) {
   return matchedCount;
 }
 
+function isCertificateTemplateField(field) {
+  return CERTIFICATE_TEMPLATE_FIELDS.has(normalizeFieldLabel(field));
+}
+
+function getCertificateTemplateFields(fields = state.fields) {
+  return (fields || []).filter((field) => isCertificateTemplateField(field));
+}
+
+function looksLikeCertificateFieldSelection(fields = state.fields) {
+  const templateFields = getCertificateTemplateFields(fields);
+  const normalizedFields = new Set(templateFields.map((field) => normalizeFieldLabel(field)));
+  if (templateFields.length < 2) {
+    return false;
+  }
+
+  return normalizedFields.has(normalizeFieldLabel("证书编号"))
+    || normalizedFields.has(normalizeFieldLabel("管理编号"))
+    || normalizedFields.has(normalizeFieldLabel("仪器名称"))
+    || (
+      normalizedFields.has(normalizeFieldLabel("客户名称"))
+      && normalizedFields.has(normalizeFieldLabel("地址"))
+    );
+}
+
+function getDocumentProfileLabel(profileId) {
+  if (profileId === CERTIFICATE_TEMPLATE_PROFILE_ID) {
+    return CERTIFICATE_TEMPLATE_PROFILE_LABEL;
+  }
+  return "";
+}
+
+function getRecordProfileLabel(record) {
+  return getDocumentProfileLabel(record?.documentProfile || "");
+}
+
 function buildQueuedOcrMessage(queuePosition) {
   if (queuePosition > 0) {
     return `扫描版 PDF 较多，当前文件排队识别中（前面还有 ${queuePosition} 个）...`;
@@ -580,6 +635,7 @@ function enqueueOcrTask(task) {
 }
 
 function buildExtractionMessage(record) {
+  const profileLabel = getRecordProfileLabel(record);
   if (record.contentState === "reading") {
     return record.contentMessage || "正在读取文件内容...";
   }
@@ -592,9 +648,12 @@ function buildExtractionMessage(record) {
   if (record.contentState === "ready") {
     const filledCount = getFilledFieldCount(record);
     if (!filledCount) {
-      return "内容已读取，但没有匹配到字段，请检查字段名或文件内容格式";
+      return profileLabel
+        ? `${profileLabel}已启用，但还没有匹配到字段，请检查字段名或文件内容格式`
+        : "内容已读取，但没有匹配到字段，请检查字段名或文件内容格式";
     }
-    return `内容已读取，自动匹配到 ${filledCount}/${state.fields.length} 个字段`;
+    const modePrefix = profileLabel ? `${profileLabel}，` : "";
+    return `内容已读取，${modePrefix}自动匹配到 ${filledCount}/${state.fields.length} 个字段`;
   }
   return "等待读取文件内容";
 }
@@ -681,6 +740,9 @@ function updateStatus() {
   const missing = getMissingTokens(state.template);
   reloadExtractBtn.disabled = !state.files.length || state.isExtracting;
   clearValuesBtn.disabled = !state.files.length || state.isExtracting;
+  if (exportDiagnosticsBtn) {
+    exportDiagnosticsBtn.disabled = !state.files.length || state.isExtracting;
+  }
 
   if (!state.files.length) {
     setStatus("请先选择至少一个文件", "warn");
@@ -759,11 +821,46 @@ function makeRecord(file) {
     contentMessage: "等待读取文件内容",
     contentTypeLabel: "",
     ocrAttempted: false,
+    documentProfile: "",
+    templateFieldValues: {},
+    templateDiagnostics: null,
   };
 }
 
 function updateRecordContentText(record) {
   record.contentText = normalizeExtractedText([record.ocrContentText, record.baseContentText].filter(Boolean).join("\n"));
+}
+
+function mergeTemplateFieldValues(record, nextValues = {}) {
+  record.templateFieldValues = {
+    ...(record.templateFieldValues || {}),
+    ...Object.fromEntries(
+      Object.entries(nextValues || {}).filter(([, value]) => normalizeWhitespace(value || "")),
+    ),
+  };
+}
+
+function mergeTemplateDiagnostics(record, nextDiagnostics = null) {
+  if (!nextDiagnostics) {
+    return;
+  }
+
+  record.templateDiagnostics = {
+    ...(record.templateDiagnostics || {}),
+    ...nextDiagnostics,
+  };
+}
+
+function applyRecordExtractionMetadata(record, metadata = {}) {
+  if (metadata.documentProfile) {
+    record.documentProfile = metadata.documentProfile;
+  }
+  if (metadata.templateFieldValues) {
+    mergeTemplateFieldValues(record, metadata.templateFieldValues);
+  }
+  if (metadata.templateDiagnostics) {
+    mergeTemplateDiagnostics(record, metadata.templateDiagnostics);
+  }
 }
 
 function buildStructuredFieldLinesFromText(text, fields = state.fields) {
@@ -870,6 +967,52 @@ function buildManifestRows(previewRows = buildPreviewRows()) {
     });
     return item;
   });
+}
+
+function buildDiagnosticsSnapshot() {
+  const previewRows = buildPreviewRows();
+  return {
+    generatedAt: new Date().toISOString(),
+    appVersion: STATIC_ASSET_VERSION,
+    locationHref: window.location.href,
+    userAgent: navigator.userAgent,
+    language: navigator.language,
+    template: state.template,
+    fields: [...state.fields],
+    likelyCertificateFieldSelection: looksLikeCertificateFieldSelection(state.fields),
+    records: previewRows.map((row) => ({
+      originalName: row.originalName,
+      previewName: row.previewName,
+      contentState: row.contentState,
+      contentMessage: row.contentMessage,
+      contentTypeLabel: row.contentTypeLabel,
+      ocrAttempted: row.ocrAttempted,
+      documentProfile: row.documentProfile,
+      documentProfileLabel: getDocumentProfileLabel(row.documentProfile),
+      values: { ...row.values },
+      autoValues: { ...row.autoValues },
+      templateFieldValues: { ...(row.templateFieldValues || {}) },
+      baseContentText: row.baseContentText,
+      ocrContentText: row.ocrContentText,
+      contentText: row.contentText,
+      templateDiagnostics: row.templateDiagnostics || null,
+    })),
+  };
+}
+
+function exportDiagnostics() {
+  if (!state.files.length) {
+    setStatus("当前没有可导出的诊断信息，请先上传文件", "warn");
+    return;
+  }
+
+  const blob = new Blob(
+    [JSON.stringify(buildDiagnosticsSnapshot(), null, 2)],
+    { type: "application/json;charset=utf-8" },
+  );
+  triggerDownload(blob, `batch-rename-diagnostics-${Date.now()}.json`);
+  setStatus("诊断信息已导出，可把 JSON 发给我继续排查", "success");
+  setTimeout(() => updateStatus(), 1800);
 }
 
 function triggerDownload(blob, fileName) {
@@ -2107,13 +2250,14 @@ function isUsableExtractedValue(value, field, options = {}) {
   return Number.isFinite(scoreFieldCandidate(field, value, options));
 }
 
-function selectBestFieldCandidate(field, candidates = []) {
-  const ranked = candidates
+function rankFieldCandidates(field, candidates = []) {
+  return candidates
     .map((candidate) => {
       if (candidate && typeof candidate === "object") {
         const normalized = normalizeFieldValueForOutput(field, candidate.value);
         return {
           value: normalized,
+          source: candidate.source || "",
           score: scoreFieldCandidate(field, normalized, candidate),
         };
       }
@@ -2126,7 +2270,10 @@ function selectBestFieldCandidate(field, candidates = []) {
     })
     .filter((candidate) => candidate.value && Number.isFinite(candidate.score))
     .sort((left, right) => right.score - left.score);
+}
 
+function selectBestFieldCandidate(field, candidates = []) {
+  const ranked = rankFieldCandidates(field, candidates);
   return ranked[0]?.value || "";
 }
 
@@ -2177,6 +2324,179 @@ function collectFieldCandidatesFromLines(text, field) {
   }
 
   return candidates;
+}
+
+function collectStrictTemplateIdentifierCandidates(text, field) {
+  const fieldKey = normalizeFieldLabel(field);
+  if (
+    fieldKey !== normalizeFieldLabel("证书编号")
+    && fieldKey !== normalizeFieldLabel("管理编号")
+  ) {
+    return [];
+  }
+
+  const lines = normalizeExtractedText(text || "")
+    .split(/\r?\n/)
+    .map((line) => normalizeWhitespace(line))
+    .filter(Boolean);
+  const candidates = [];
+  const seen = new Set();
+
+  lines.forEach((line) => {
+    extractIdentifierLikeCandidates(line).forEach((identifier) => {
+      const normalized = normalizeFieldValueForOutput(field, identifier);
+      if (!normalized) {
+        return;
+      }
+
+      const isValid = fieldKey === normalizeFieldLabel("证书编号")
+        ? looksLikeCertificateIdentifier(normalized) && !looksLikeManagementIdentifier(normalized)
+        : looksLikeManagementIdentifier(normalized) && !looksLikeCertificateIdentifier(normalized);
+      if (!isValid || seen.has(normalized)) {
+        return;
+      }
+
+      seen.add(normalized);
+      let sourceBonus = fieldKey === normalizeFieldLabel("管理编号") ? 24 : 18;
+      if (matchesFieldLabelText(line, field)) {
+        sourceBonus += 10;
+      }
+      if (fieldKey === normalizeFieldLabel("证书编号") && /(证书|Certificate)/i.test(line)) {
+        sourceBonus += 12;
+      }
+      if (fieldKey === normalizeFieldLabel("管理编号") && /(管理|Management|LD[-_/]?EQ)/i.test(line)) {
+        sourceBonus += 12;
+      }
+
+      candidates.push({ value: normalized, rawValue: line, sourceBonus, source: "strict-pattern" });
+    });
+  });
+
+  return candidates;
+}
+
+function collectCertificateTemplateFieldCandidates(text, field, source = "text", sourceBonusOffset = 0) {
+  const explicitCandidates = collectFieldCandidatesFromLines(text, field).map((candidate) => ({
+    ...candidate,
+    source,
+    sourceBonus: (candidate.sourceBonus || 0) + sourceBonusOffset,
+  }));
+  const strictIdentifierCandidates = collectStrictTemplateIdentifierCandidates(text, field).map((candidate) => ({
+    ...candidate,
+    source,
+    sourceBonus: (candidate.sourceBonus || 0) + sourceBonusOffset,
+  }));
+
+  return [...explicitCandidates, ...strictIdentifierCandidates];
+}
+
+function summarizeFieldCandidatesForDiagnostics(field, candidates = []) {
+  return candidates
+    .map((candidate) => {
+      const value = normalizeFieldValueForOutput(field, candidate.value);
+      const score = scoreFieldCandidate(field, value, candidate);
+      if (!value || !Number.isFinite(score)) {
+        return null;
+      }
+      return {
+        value,
+        score,
+        source: candidate.source || "",
+        sourceBonus: candidate.sourceBonus || 0,
+        rawValue: normalizeWhitespace(candidate.rawValue || candidate.value || "").slice(0, 180),
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => right.score - left.score)
+    .slice(0, 5);
+}
+
+function detectCertificateDocumentProfile(options = {}) {
+  const fields = options.fields || state.fields;
+  if (!looksLikeCertificateFieldSelection(fields)) {
+    return "";
+  }
+
+  const markerSource = normalizeExtractedText([options.baseText, options.rawText].filter(Boolean).join("\n")).toLowerCase();
+  const markerHits = CERTIFICATE_TEMPLATE_MARKERS.filter((marker) => markerSource.includes(marker.toLowerCase())).length;
+  const templateFieldValues = options.templateFieldValues || {};
+  const templateFieldHits = Object.entries(templateFieldValues)
+    .filter(([field, value]) => isCertificateTemplateField(field) && normalizeWhitespace(value || ""))
+    .length;
+  const normalizedTemplateFieldKeys = new Set(
+    Object.entries(templateFieldValues)
+      .filter(([, value]) => normalizeWhitespace(value || ""))
+      .map(([field]) => normalizeFieldLabel(field)),
+  );
+  const hasAnchorField = normalizedTemplateFieldKeys.has(normalizeFieldLabel("证书编号"))
+    || normalizedTemplateFieldKeys.has(normalizeFieldLabel("管理编号"))
+    || normalizedTemplateFieldKeys.has(normalizeFieldLabel("仪器名称"));
+
+  if (markerHits >= 2) {
+    return CERTIFICATE_TEMPLATE_PROFILE_ID;
+  }
+  if (markerHits >= 1 && templateFieldHits >= 2 && hasAnchorField) {
+    return CERTIFICATE_TEMPLATE_PROFILE_ID;
+  }
+  if (templateFieldHits >= 3 && hasAnchorField) {
+    return CERTIFICATE_TEMPLATE_PROFILE_ID;
+  }
+  return "";
+}
+
+function selectCertificateTemplateFieldValue(field, candidates = []) {
+  const fieldKey = normalizeFieldLabel(field);
+  const ranked = rankFieldCandidates(field, candidates);
+  if (!ranked.length) {
+    return "";
+  }
+
+  if (
+    fieldKey === normalizeFieldLabel("证书编号")
+    || fieldKey === normalizeFieldLabel("管理编号")
+  ) {
+    const strongRawCandidate = ranked.find((candidate) => {
+      if (candidate.source !== "raw") {
+        return false;
+      }
+      if (fieldKey === normalizeFieldLabel("证书编号")) {
+        return looksLikeCertificateIdentifier(candidate.value) && candidate.score >= 420;
+      }
+      return looksLikeManagementIdentifier(candidate.value) && candidate.score >= 300;
+    });
+
+    if (strongRawCandidate) {
+      return strongRawCandidate.value;
+    }
+  }
+
+  return ranked[0]?.value || "";
+}
+
+function extractCertificateTemplateFieldBundle(options = {}) {
+  const fields = options.fields || state.fields;
+  const templateFields = getCertificateTemplateFields(fields);
+  const structuredText = normalizeExtractedText(options.structuredText || "");
+  const rawText = normalizeExtractedText(options.rawText || "");
+  const values = {};
+  const fieldCandidates = {};
+
+  templateFields.forEach((field) => {
+    const candidates = [
+      ...collectCertificateTemplateFieldCandidates(structuredText, field, "structured", 28),
+      ...collectCertificateTemplateFieldCandidates(rawText, field, "raw", 8),
+    ];
+    const value = selectCertificateTemplateFieldValue(field, candidates);
+    if (value) {
+      values[field] = value;
+    }
+    fieldCandidates[field] = summarizeFieldCandidatesForDiagnostics(field, candidates);
+  });
+
+  return {
+    values,
+    fieldCandidates,
+  };
 }
 
 function collectLooseIdentifierCandidates(text, field) {
@@ -2259,10 +2579,21 @@ function extractFieldValueFromText(text, field) {
   return selectBestFieldCandidate(field, candidates);
 }
 
+function getLockedRecordFieldValue(record, field) {
+  if (
+    record.documentProfile === CERTIFICATE_TEMPLATE_PROFILE_ID
+    && isCertificateTemplateField(field)
+  ) {
+    return normalizeFieldValueForOutput(field, record.templateFieldValues?.[field] || "");
+  }
+  return "";
+}
+
 function syncValuesFromContent(record) {
   state.fields.forEach((field) => {
     const previousAuto = record.autoValues[field] || "";
-    const extracted = extractFieldValueFromText(record.contentText, field);
+    const lockedValue = getLockedRecordFieldValue(record, field);
+    const extracted = lockedValue || extractFieldValueFromText(record.contentText, field);
     const current = record.values[field] || "";
     const shouldReplace = !normalizeWhitespace(current) || current === previousAuto;
     record.autoValues[field] = extracted || "";
@@ -2270,6 +2601,16 @@ function syncValuesFromContent(record) {
       record.values[field] = extracted || "";
     }
   });
+}
+
+function getPdfOcrTargetFields(record) {
+  const missingFields = getMissingFieldList(record);
+  if (!looksLikeCertificateFieldSelection(state.fields)) {
+    return missingFields;
+  }
+
+  const templateFields = getCertificateTemplateFields(state.fields);
+  return [...new Set([...missingFields, ...templateFields])];
 }
 
 async function getPdfJsLib() {
@@ -2348,6 +2689,9 @@ async function extractPdfTextWithOcr(file, fields = state.fields) {
   const worker = await getOcrWorker();
   const pageCount = Math.min(pdf.numPages, PDF_MAX_PAGES_TO_READ);
   const chunks = [];
+  const pageDiagnostics = [];
+  let mergedTemplateFieldValues = {};
+  let documentProfile = "";
 
   for (let pageNumber = 1; pageNumber <= pageCount; pageNumber += 1) {
     const page = await pdf.getPage(pageNumber);
@@ -2358,11 +2702,34 @@ async function extractPdfTextWithOcr(file, fields = state.fields) {
     const regionFirst = await buildPreciseRegionStructuredText(canvas, rawCanvas, worker, fields, pageNumber);
     const regionStructuredText = normalizeExtractedText(regionFirst.text);
     const unresolvedFields = regionFirst.unresolvedFields;
+    const regionTemplateBundle = extractCertificateTemplateFieldBundle({
+      structuredText: regionStructuredText,
+      rawText: "",
+      fields,
+    });
+    mergedTemplateFieldValues = {
+      ...mergedTemplateFieldValues,
+      ...regionTemplateBundle.values,
+    };
+    documentProfile = documentProfile || detectCertificateDocumentProfile({
+      rawText: regionStructuredText,
+      templateFieldValues: mergedTemplateFieldValues,
+      fields,
+    });
 
     if (!unresolvedFields.length) {
       if (regionStructuredText) {
         chunks.push(regionStructuredText);
       }
+      pageDiagnostics.push({
+        pageNumber,
+        unresolvedFields,
+        regionStructuredText,
+        structuredText: "",
+        rawTextPreview: "",
+        templateFieldValues: regionTemplateBundle.values,
+        fieldCandidates: regionTemplateBundle.fieldCandidates,
+      });
       break;
     }
 
@@ -2376,6 +2743,30 @@ async function extractPdfTextWithOcr(file, fields = state.fields) {
     const rawText = normalizeExtractedText(result?.data?.text || "");
     const ocrLines = parseTesseractTsv(result?.data?.tsv || "");
     const structuredText = await buildStructuredTextFromOcrPage(canvas, rawCanvas, worker, ocrLines, unresolvedFields, pageNumber);
+    const combinedStructuredText = normalizeExtractedText([regionStructuredText, structuredText].filter(Boolean).join("\n"));
+    const templateBundle = extractCertificateTemplateFieldBundle({
+      structuredText: combinedStructuredText,
+      rawText,
+      fields,
+    });
+    mergedTemplateFieldValues = {
+      ...mergedTemplateFieldValues,
+      ...templateBundle.values,
+    };
+    documentProfile = documentProfile || detectCertificateDocumentProfile({
+      rawText,
+      templateFieldValues: mergedTemplateFieldValues,
+      fields,
+    });
+    pageDiagnostics.push({
+      pageNumber,
+      unresolvedFields,
+      regionStructuredText,
+      structuredText,
+      rawTextPreview: rawText.slice(0, 2000),
+      templateFieldValues: templateBundle.values,
+      fieldCandidates: templateBundle.fieldCandidates,
+    });
     const pageText = normalizeExtractedText([regionStructuredText, structuredText, rawText].filter(Boolean).join("\n"));
 
     if (pageText) {
@@ -2386,7 +2777,20 @@ async function extractPdfTextWithOcr(file, fields = state.fields) {
     }
   }
 
-  return chunks.join("\n\n");
+  return {
+    text: chunks.join("\n\n"),
+    documentProfile,
+    templateFieldValues: documentProfile === CERTIFICATE_TEMPLATE_PROFILE_ID ? mergedTemplateFieldValues : {},
+    templateDiagnostics: looksLikeCertificateFieldSelection(fields)
+      ? {
+        ocr: {
+          documentProfile,
+          templateFieldValues: mergedTemplateFieldValues,
+          pages: pageDiagnostics,
+        },
+      }
+      : null,
+  };
 }
 
 function xmlToPlainText(xml) {
@@ -2423,16 +2827,41 @@ async function readTextFromFile(record) {
       state: "ready",
       message: "文本内容读取完成",
       typeLabel: ext.slice(1).toUpperCase() || "TEXT",
+      documentProfile: "",
+      templateFieldValues: {},
+      templateDiagnostics: null,
     };
   }
 
   if (ext === ".pdf") {
     const extractedText = await extractPdfText(record.file);
+    const baseTemplateBundle = extractCertificateTemplateFieldBundle({
+      structuredText: extractedText,
+      rawText: extractedText,
+      fields: state.fields,
+    });
+    const documentProfile = detectCertificateDocumentProfile({
+      baseText: extractedText,
+      templateFieldValues: baseTemplateBundle.values,
+      fields: state.fields,
+    });
     return {
       text: extractedText,
       state: "ready",
       message: normalizeExtractedText(extractedText) ? "PDF 内容读取完成" : "PDF 没有可直接提取的文字，准备尝试 OCR",
       typeLabel: "PDF",
+      documentProfile,
+      templateFieldValues: documentProfile === CERTIFICATE_TEMPLATE_PROFILE_ID ? baseTemplateBundle.values : {},
+      templateDiagnostics: looksLikeCertificateFieldSelection(state.fields)
+        ? {
+          base: {
+            documentProfile,
+            templateFieldValues: baseTemplateBundle.values,
+            fieldCandidates: baseTemplateBundle.fieldCandidates,
+            rawTextPreview: normalizeExtractedText(extractedText).slice(0, 2000),
+          },
+        }
+        : null,
     };
   }
 
@@ -2442,6 +2871,9 @@ async function readTextFromFile(record) {
       state: "ready",
       message: "DOCX 内容读取完成",
       typeLabel: "DOCX",
+      documentProfile: "",
+      templateFieldValues: {},
+      templateDiagnostics: null,
     };
   }
 
@@ -2450,6 +2882,9 @@ async function readTextFromFile(record) {
     state: "unsupported",
     message: `暂不支持自动读取 ${ext || "该文件类型"} 内容`,
     typeLabel: ext ? ext.slice(1).toUpperCase() : "UNKNOWN",
+    documentProfile: "",
+    templateFieldValues: {},
+    templateDiagnostics: null,
   };
 }
 
@@ -2470,32 +2905,34 @@ async function populateRecordFromContent(record, options = {}) {
       record.contentState = result.state;
       record.contentMessage = result.message;
       record.contentTypeLabel = result.typeLabel;
+      applyRecordExtractionMetadata(record, result);
     }
 
     if (record.contentState === "ready") {
       syncValuesFromContent(record);
-      const missingFields = getMissingFieldList(record);
+      const ocrTargetFields = getPdfOcrTargetFields(record);
 
       if (
         record.extensionLower === ".pdf"
         && !record.ocrAttempted
-        && missingFields.length
+        && ocrTargetFields.length
       ) {
         const queuedTask = enqueueOcrTask(async () => {
           record.contentState = "reading";
           record.contentMessage = "正在识别扫描版 PDF，可能需要 1 分钟左右...";
           renderDataViews();
-          return extractPdfTextWithOcr(record.file, missingFields);
+          return extractPdfTextWithOcr(record.file, ocrTargetFields);
         });
         record.contentState = "reading";
         record.contentMessage = buildQueuedOcrMessage(queuedTask.queuePosition);
         renderDataViews();
-        const ocrText = await queuedTask.promise;
+        const ocrResult = await queuedTask.promise;
         record.ocrAttempted = true;
         record.contentState = "ready";
 
-        if (normalizeExtractedText(ocrText)) {
-          record.ocrContentText = mergeOcrExtractionText(record.ocrContentText, ocrText, state.fields);
+        if (normalizeExtractedText(ocrResult?.text || "")) {
+          record.ocrContentText = mergeOcrExtractionText(record.ocrContentText, ocrResult.text, state.fields);
+          applyRecordExtractionMetadata(record, ocrResult);
           updateRecordContentText(record);
           syncValuesFromContent(record);
         }
@@ -2623,6 +3060,13 @@ resetTemplateBtn.addEventListener("click", () => {
   templateInput.value = state.template;
   render();
 });
+if (exportDiagnosticsBtn) {
+  exportDiagnosticsBtn.addEventListener("click", exportDiagnostics);
+}
 exportZipBtn.addEventListener("click", exportZip);
+
+if (appVersionBadge) {
+  appVersionBadge.textContent = `当前版本 ${STATIC_ASSET_VERSION}`;
+}
 
 render();

@@ -332,3 +332,55 @@
 - 同时回归 `/Users/fangpei/Desktop/导出内容资料/SCAN0000 1.pdf`：
   - `证书编号` 已恢复为 `Z20252-G244005`
   - 其余本轮未覆盖的泛编号字段（例如 `出厂编号`）仍沿用旧的通用编号提取路径，不在这次 5 字段精修范围内
+
+## 2026-06-10 Certificate Template Lock Mode
+- 已为证书类 PDF 增加“第一页模板锁定模式”，专门覆盖以下字段：
+  - `证书编号`
+  - `客户名称`
+  - `地址`
+  - `管理编号`
+  - `仪器名称`
+- 这组字段现在不再直接吃通用 `extractFieldValueFromText(...)` 的最终结果，而是走固定链路：
+  - 先取第一页区域/邻近标签提取出的结构化候选
+  - 再用整页 OCR 中的强候选做校正
+  - 对 `证书编号`、`管理编号`，当整页强候选足够可靠时，优先使用整页结果，区域值只做兜底
+- 页面新增两项可见能力：
+  - 顶部版本角标，便于确认是否命中最新页面
+  - `导出诊断信息` 按钮，导出的 JSON 会带版本号、模板模式、字段最终值、模板候选和 OCR 页诊断
+- 已同步将静态资源版本号提升为 `20260610-certlock1`
+
+## 2026-06-10 Certificate Template Lock Verification
+- 语法检查：
+  - `node --check app.js`
+- 真实页面回归：
+  - `/tmp/batch-rename-debug/repro-scan0002-3fields.js`
+    - 6 份 `SCAN0002-*` 样本在约 `26s` 内完成
+    - 当前结果：
+      - `页面提取自－SCAN0002-2.pdf` => `证书编号 Z20251-6247993`
+      - `页面提取自－SCAN0002-3.pdf` => `证书编号 Z2025N12-6270129`
+      - `页面提取自－SCAN0002-4.pdf` => `证书编号 Z2025N12-6406171`
+      - `页面提取自－SCAN0002-5.pdf` => `证书编号 Z2025N12-6270143`
+      - `页面提取自－SCAN0002-6.pdf` => `证书编号 Z2025N12-G270185`
+      - `页面提取自－SCAN0002-7.pdf` => `证书编号 Z2025N12-6406184`
+    - `客户名称 / 地址` 在 6 份样本上均保持为：
+      - `瑞因细胞工程科技（广州）有限公司`
+      - `广州市黄埔区开源大道188号自编七栋101房`
+  - `/tmp/batch-rename-debug/repro-scan0002-5fields.js`
+    - 6 份 `SCAN0002-*` 样本在约 `27s` 内完成
+    - `管理编号 / 仪器名称` 当前结果保持完整：
+      - `页面提取自－SCAN0002-2.pdf` => `LD-EQ058-4 / 二氧化碳培养箱`
+      - `页面提取自－SCAN0002-3.pdf` => `LD-EQ028-12 / 移液器`
+      - `页面提取自－SCAN0002-4.pdf` => `LD-EQ028-11 / 移液器`
+      - `页面提取自－SCAN0002-5.pdf` => `LD-EQ031-5 / 移液器`
+      - `页面提取自－SCAN0002-6.pdf` => `LD-EQ032-3 / 移液器`
+      - `页面提取自－SCAN0002-7.pdf` => `LD-EQ035-7 / 移液器`
+- 页面可见性检查：
+  - 顶部版本角标显示 `当前版本 20260610-certlock1`
+  - `buildDiagnosticsSnapshot()` 返回：
+    - `appVersion = 20260610-certlock1`
+    - `documentProfile = calibration-certificate-v1`
+    - `documentProfileLabel = 证书第一页锁定模式`
+    - 每条记录带 `templateFieldValues` 和 `templateDiagnostics.ocr.pages`
+- 备注：
+  - `ocrContentText` 里仍会保留区域 OCR 和整页 OCR 的混合原始文本，便于诊断
+  - 但证书模板字段最终回填时，真正使用的是 `templateFieldValues`，不再被这段混合文本重新覆盖

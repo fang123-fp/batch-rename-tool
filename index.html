@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>批量文件重命名台</title>
-    <link rel="stylesheet" href="./styles.css?v=20260610-certregion2" />
+    <link rel="stylesheet" href="./styles.css?v=20260610-certlock1" />
   </head>
   <body>
     <div class="page-shell">
@@ -16,6 +16,10 @@
             选择多个文件后会先按列表显示，再根据你配置的字段和模板批量重命名。
             原始文件不会被直接改名，下载的 ZIP 里会是重命名后的结果。
           </p>
+          <div class="hero-meta">
+            <span id="appVersionBadge" class="badge-pill">当前版本加载中</span>
+            <span class="badge-pill badge-pill-soft">证书 PDF 会优先走第一页模板锁定提取</span>
+          </div>
         </div>
       </header>
 
@@ -70,6 +74,7 @@
           <div class="panel-head">
             <h2>文件列表</h2>
             <div class="panel-actions">
+              <button id="exportDiagnosticsBtn" class="ghost-btn" type="button">导出诊断信息</button>
               <button id="reloadExtractBtn" class="ghost-btn" type="button">从内容重新读取</button>
               <button id="clearValuesBtn" class="ghost-btn" type="button">清空字段值</button>
             </div>
@@ -100,7 +105,7 @@
       </footer>
     </div>
 
-    <script src="./vendor/jszip.min.js?v=20260610-certregion2"></script>
-    <script src="./app.js?v=20260610-certregion2"></script>
+    <script src="./vendor/jszip.min.js?v=20260610-certlock1"></script>
+    <script src="./app.js?v=20260610-certlock1"></script>
   </body>
 </html>

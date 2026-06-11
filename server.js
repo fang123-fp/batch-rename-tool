@@ -12,7 +12,7 @@ const port = Number(process.env.PORT || 8123);
 const rootDir = __dirname;
 const baseDir = path.resolve(rootDir);
 const tempRootDir = path.join(baseDir, '.tmp');
-const APP_VERSION = '20260611-scanfix2';
+const APP_VERSION = '20260611-scanfix3';
 const maxUploadFiles = Number(process.env.MAX_UPLOAD_FILES || 200);
 const maxUploadFileSize = Number(process.env.MAX_UPLOAD_FILE_SIZE || 50 * 1024 * 1024);
 

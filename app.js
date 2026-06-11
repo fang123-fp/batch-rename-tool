@@ -182,7 +182,7 @@ let tesseractLoadPromise;
 let ocrQueueTail = Promise.resolve();
 let activeOcrJobCount = 0;
 let waitingOcrJobCount = 0;
-const APP_VERSION = "20260611-scanfix2";
+const APP_VERSION = "20260611-scanfix3";
 const STATIC_ASSET_VERSION = APP_VERSION;
 const BACKEND_DISABLED_BY_QUERY = new URLSearchParams(window.location.search).get("backend") === "off";
 const BACKEND_EXTRACTABLE_EXTENSIONS = new Set([".pdf"]);

@@ -34,7 +34,7 @@ const KNOWN_PDF_FIELD_REGION_HINTS = {
 };
 const FIELD_LABEL_ALIASES = {
   [normalizeFieldLabel("证书编号")]: ["证书编号", "证书号", "Certificate No.", "Certificate No", "Certificate Number"],
-  [normalizeFieldLabel("客户名称")]: ["客户名称", "Client Name"],
+  [normalizeFieldLabel("客户名称")]: ["客户名称", "客户名", "客名称", "客/名称", "Client Name"],
   [normalizeFieldLabel("地址")]: ["地址", "Address"],
   [normalizeFieldLabel("仪器名称")]: ["仪器名称", "Description", "Instrument Name"],
   [normalizeFieldLabel("管理编号")]: ["管理编号", "Management No.", "Management No", "Management Number"],
@@ -1128,8 +1128,16 @@ function getFlexibleFieldPatterns(field) {
     .sort((left, right) => right.length - left.length);
 }
 
+function getBoundedFlexibleFieldPatterns(field) {
+  return getFlexibleFieldPatterns(field)
+    .map((pattern) => `${pattern}(?=$|\\s|[：:])`)
+    .filter(Boolean);
+}
+
 function normalizeComparableLabel(value) {
-  return normalizeFieldLabel(String(value || "").replace(/[：:,.，。]+$/g, ""));
+  return normalizeFieldLabel(String(value || "")
+    .replace(/[：:,.，。]+$/g, "")
+    .replace(/[／/\\|｜·•]+/g, ""));
 }
 
 function matchesFieldLabelText(text, field) {
@@ -1163,7 +1171,7 @@ function stripLeadingFieldLabelPrefix(field, value) {
     return "";
   }
 
-  const patterns = getFlexibleFieldPatterns(field);
+  const patterns = getBoundedFlexibleFieldPatterns(field);
   if (!patterns.length) {
     return nextValue;
   }
@@ -1293,11 +1301,19 @@ function normalizeCertificateIdentifierArtifacts(value) {
   }
 
   const variants = new Set([identifier]);
-  if (/^[2L]/i.test(identifier)) {
+  if (/^[27L]/i.test(identifier)) {
     variants.add(`Z${identifier.slice(1)}`);
   }
 
   [...variants].forEach((candidate) => {
+    const trimmedTrailingLetters = candidate.replace(
+      /^([A-Z]\d{4}(?:\d|[A-Z]\d{2})-(?:\d{7}|[A-Z]\d{6}))[A-Z]{1,4}$/i,
+      "$1",
+    );
+    if (trimmedTrailingLetters !== candidate) {
+      variants.add(trimmedTrailingLetters);
+    }
+
     const shortened = candidate.replace(/^([A-Z]\d{4}(?:\d|[A-Z]\d{2})-)([A-Z])\d(\d{6})$/i, "$1$2$3");
     if (shortened !== candidate) {
       variants.add(shortened);
@@ -1421,7 +1437,7 @@ function stripTrailingPaginationArtifacts(value) {
 
 function extractInlineFieldValue(text, field) {
   const source = normalizeWhitespace(text || "");
-  const fieldPatterns = getFlexibleFieldPatterns(field);
+  const fieldPatterns = getBoundedFlexibleFieldPatterns(field);
   if (!source || !fieldPatterns.length) {
     return "";
   }
@@ -1526,7 +1542,7 @@ function parseTesseractTsv(tsvText) {
 
 function findBestOcrLabelLine(lines, field) {
   return lines.find((line) => matchesFieldLabelText(line.text, field))
-    || lines.find((line) => getFlexibleFieldPatterns(field).some((pattern) => new RegExp(pattern, "i").test(line.text)));
+    || lines.find((line) => getBoundedFlexibleFieldPatterns(field).some((pattern) => new RegExp(pattern, "i").test(line.text)));
 }
 
 function pickBestOcrValueCandidate(labelLine, lines, field) {
@@ -2274,6 +2290,7 @@ function scoreFieldCandidate(field, value, options = {}) {
       return -Infinity;
     }
 
+    const addressHintHits = countKeywordHits(normalized, ADDRESS_HINTS);
     const suspiciousSymbolCount = countPatternMatches(normalized, /[=|｜_`~]/g);
     const quoteCount = countPatternMatches(normalized, /["'“”‘’]/g);
     score += cjkCount * 14;
@@ -2286,6 +2303,12 @@ function scoreFieldCandidate(field, value, options = {}) {
     }
     if (hasExplicitFieldTextPrefix(originalText, field)) {
       score += 28;
+    }
+    if (addressHintHits >= 2 && digitCount >= 2) {
+      score -= 260;
+    }
+    if (addressHintHits >= 3) {
+      return -Infinity;
     }
     if (/日期|Date|编号|No\.?|地址|Address|Model|Type|规格|管理|校准|证书/i.test(originalText) && !matchesFieldLabelText(originalText, field)) {
       return -Infinity;
@@ -2402,7 +2425,7 @@ function collectFieldCandidatesFromLines(text, field) {
     .split(/\r?\n/)
     .map((line) => normalizeWhitespace(line))
     .filter(Boolean);
-  const fieldPatterns = getFlexibleFieldPatterns(field);
+  const fieldPatterns = getBoundedFlexibleFieldPatterns(field);
   const candidates = [];
 
   if (!lines.length || !fieldPatterns.length) {
@@ -2711,7 +2734,7 @@ function extractFieldValueFromLines(text, field) {
 }
 
 function extractFieldValueFromText(text, field) {
-  const fieldPatterns = getFlexibleFieldPatterns(field);
+  const fieldPatterns = getBoundedFlexibleFieldPatterns(field);
   if (!text || !fieldPatterns.length) {
     return "";
   }

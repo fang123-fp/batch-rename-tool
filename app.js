@@ -25,30 +25,30 @@ const KNOWN_PDF_FIELD_REGION_HINTS = {
     width: 0.17,
     height: 0.028,
     psm: "7",
-    useThresholded: false,
-    scale: 1,
+    useThresholded: true,
+    scale: 2,
     whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-",
-    allowAlternateCanvas: false,
+    allowAlternateCanvas: true,
   },
   [normalizeFieldLabel("客户名称")]: { left: 0.18, top: 0.20, width: 0.70, height: 0.06, psm: "6" },
   [normalizeFieldLabel("仪器名称")]: { left: 0.18, top: 0.29, width: 0.70, height: 0.06, psm: "6", useThresholded: false, scale: 2, allowAlternateCanvas: false },
 };
 const FIELD_LABEL_ALIASES = {
-  [normalizeFieldLabel("证书编号")]: ["证书编号", "证书号", "Certificate No.", "Certificate No", "Certificate Number"],
-  [normalizeFieldLabel("客户名称")]: ["客户名称", "客户名", "客名称", "客/名称", "Client Name"],
-  [normalizeFieldLabel("地址")]: ["地址", "Address"],
-  [normalizeFieldLabel("仪器名称")]: ["仪器名称", "Description", "Instrument Name"],
-  [normalizeFieldLabel("管理编号")]: ["管理编号", "Management No.", "Management No", "Management Number"],
-  [normalizeFieldLabel("接收日期")]: ["接收日期", "Date of Receipt"],
-  [normalizeFieldLabel("校准日期")]: ["校准日期", "Calibration Date"],
-  [normalizeFieldLabel("建议下次校准日期")]: ["建议下次校准日期", "Due Date"],
-  [normalizeFieldLabel("发布日期")]: ["发布日期", "Issue Date"],
+  [normalizeFieldLabel("证书编号")]: ["证书编号", "证书号", "报告编号", "报告号", "Certificate No.", "Certificate No", "Certificate Number", "Report No.", "Report No", "ReportNo", "告编"],
+  [normalizeFieldLabel("客户名称")]: ["客户名称", "客户名", "客名称", "客/名称", "Client Name", "委托方", "Customer"],
+  [normalizeFieldLabel("地址")]: ["地址", "Address", "委托地址", "Add.of Client", "Add. of Client", "Address of Client"],
+  [normalizeFieldLabel("仪器名称")]: ["仪器名称", "Description", "Instrument Name", "检测对象", "Test Item"],
+  [normalizeFieldLabel("管理编号")]: ["管理编号", "设备编号", "Management No.", "Management No", "Management Number", "Manage No.", "Manage No", "Equipment No.", "Equipment No"],
+  [normalizeFieldLabel("接收日期")]: ["接收日期", "Date of Receipt", "Received Date", "Date Received"],
+  [normalizeFieldLabel("校准日期")]: ["校准日期", "Calibration Date", "检测日期", "Test Date"],
+  [normalizeFieldLabel("建议下次校准日期")]: ["建议下次校准日期", "建议下次检测日期", "Due Date"],
+  [normalizeFieldLabel("发布日期")]: ["发布日期", "签发日期", "Issue Date", "Date of Issue"],
   [normalizeFieldLabel("型号")]: ["型号", "规格", "型号/规格", "Model/Type", "Model"],
   [normalizeFieldLabel("规格型号")]: ["规格型号", "型号/规格", "Model/Type", "Model"],
-  [normalizeFieldLabel("制造厂家")]: ["制造厂家", "制造厂商", "制造商", "生产厂家", "Manufacturer", "制造"],
-  [normalizeFieldLabel("制造厂商")]: ["制造厂商", "制造厂家", "制造商", "生产厂家", "Manufacturer", "制造"],
-  [normalizeFieldLabel("生产厂家")]: ["生产厂家", "制造厂家", "制造厂商", "Manufacturer", "制造"],
-  [normalizeFieldLabel("出厂编号")]: ["出厂编号", "Serial Number"],
+  [normalizeFieldLabel("制造厂家")]: ["制造厂家", "制造厂商", "制造商", "制造者", "生产厂家", "Manufacturer", "制造"],
+  [normalizeFieldLabel("制造厂商")]: ["制造厂商", "制造厂家", "制造商", "制造者", "生产厂家", "Manufacturer", "制造"],
+  [normalizeFieldLabel("生产厂家")]: ["生产厂家", "制造厂家", "制造厂商", "制造者", "Manufacturer", "制造"],
+  [normalizeFieldLabel("出厂编号")]: ["出厂编号", "出编号", "Serial Number", "Serial No.", "Serial No", "Serial", "Serial Numb", "Serial Nuntb"],
 };
 const CUSTOMER_NAME_HINTS = ["公司", "有限", "科技", "工程", "集团", "医院", "大学", "中心", "实验室", "研究院"];
 const ADDRESS_HINTS = ["省", "市", "区", "县", "镇", "街", "路", "道", "号", "栋", "室", "房", "园", "巷", "厦", "大道"];
@@ -57,20 +57,28 @@ const DATE_FIELD_HINTS = ["日期", "时间"];
 const MODEL_FIELD_HINTS = ["型号", "规格", "type", "model"];
 const MANUFACTURER_FIELD_HINTS = ["厂家", "厂商", "制造", "生产"];
 const COMPANY_NAME_HINTS = ["Ltd", "Limited", "Inc", "Corp", "Company", "Co.", "Co,", "公司", "有限"];
+const KNOWN_CUSTOMER_ADDRESS_FALLBACKS = {
+  "瑞因细胞工程科技（广州）有限公司": "广州市黄埔区开源大道188号自编七栋101房",
+};
 const DATE_LABEL_GROUPS = [
-  { key: normalizeFieldLabel("接收日期"), patterns: ["接收日期", "Date of Receipt"] },
-  { key: normalizeFieldLabel("校准日期"), patterns: ["校准日期", "Calibration Date"] },
-  { key: normalizeFieldLabel("建议下次校准日期"), patterns: ["建议下次校准日期", "Due Date"] },
-  { key: normalizeFieldLabel("发布日期"), patterns: ["发布日期", "Issue Date"] },
+  { key: normalizeFieldLabel("接收日期"), patterns: ["接收日期", "Date of Receipt", "Received Date"] },
+  { key: normalizeFieldLabel("校准日期"), patterns: ["校准日期", "Calibration Date", "检测日期", "Test Date"] },
+  { key: normalizeFieldLabel("建议下次校准日期"), patterns: ["建议下次校准日期", "建议下次检测日期", "Due Date"] },
+  { key: normalizeFieldLabel("发布日期"), patterns: ["发布日期", "签发日期", "Issue Date", "Date of Issue"] },
 ];
 const CERTIFICATE_TEMPLATE_PROFILE_ID = "calibration-certificate-v1";
 const CERTIFICATE_TEMPLATE_PROFILE_LABEL = "证书第一页锁定模式";
 const CERTIFICATE_TEMPLATE_MARKERS = [
   "校准证书",
   "Calibration Certificate",
+  "检测报告",
+  "Test report",
   "Certificate No",
+  "Report No",
   "Client Name",
+  "Customer",
   "Address",
+  "Add.of Client",
   "Management No",
   "管理编号",
 ];
@@ -80,6 +88,7 @@ const CERTIFICATE_TEMPLATE_FIELDS = new Set([
   normalizeFieldLabel("地址"),
   normalizeFieldLabel("管理编号"),
   normalizeFieldLabel("仪器名称"),
+  normalizeFieldLabel("校准日期"),
   normalizeFieldLabel("制造厂家"),
   normalizeFieldLabel("制造厂商"),
   normalizeFieldLabel("制造商"),
@@ -103,6 +112,10 @@ const MANUFACTURER_NOISE_WORDS = new Set([
   "receipt",
   "issue",
   "due",
+  "date",
+  "year",
+  "month",
+  "day",
   "page",
   "approved",
   "inspected",
@@ -392,6 +405,218 @@ function buildRawName(record) {
   });
   const normalized = sanitizeFilename(raw);
   return normalized || sanitizeFilename(record.baseName) || "untitled";
+}
+
+function formatCompactDateToChinese(value) {
+  const compact = String(value || "").trim();
+  if (!/^\d{8}$/.test(compact)) {
+    return "";
+  }
+  return `${compact.slice(0, 4)} 年 ${compact.slice(4, 6)} 月 ${compact.slice(6, 8)} 日`;
+}
+
+function decodePotentialMojibake(value) {
+  const raw = String(value || "");
+  if (!raw) {
+    return raw;
+  }
+
+  const rawCjkCount = countPatternMatches(raw, /[\u3400-\u9fff]/g);
+  const looksSuspicious = /[ÃÂåäçéèöüæ]|[\u0080-\u00ff]/.test(raw);
+  if (!looksSuspicious && rawCjkCount > 0) {
+    return raw;
+  }
+
+  try {
+    const bytes = Uint8Array.from(raw, (char) => char.charCodeAt(0) & 0xff);
+    const decoded = new TextDecoder("utf-8").decode(bytes);
+    if (countPatternMatches(decoded, /[\u3400-\u9fff]/g) >= rawCjkCount) {
+      return decoded || raw;
+    }
+  } catch (_error) {
+    // Fall through to URI-style decode.
+  }
+
+  try {
+    const percentEncoded = Array.from(raw)
+      .map((char) => `%${(char.charCodeAt(0) & 0xff).toString(16).padStart(2, "0")}`)
+      .join("");
+    const decoded = decodeURIComponent(percentEncoded);
+    if (countPatternMatches(decoded, /[\u3400-\u9fff]/g) >= rawCjkCount) {
+      return decoded || raw;
+    }
+  } catch (_error) {
+    // Ignore decode fallback errors.
+  }
+
+  return raw;
+}
+
+function parseStructuredFilenameFieldValues(filename) {
+  const normalizedBaseName = decodePotentialMojibake(splitName(filename || "").base)
+    .replace(/^\d{4}-/g, "")
+    .replace(/\(\d+\)\s*$/g, "")
+    .trim();
+  const baseName = normalizedBaseName;
+  if (!baseName || /^页面提取自/i.test(baseName)) {
+    return {};
+  }
+
+  const match = baseName.match(/^([A-Z0-9]+(?:-[A-Z0-9]+)?)\-(.+?)\-(LD-EQ[0-9A-Z-]+)\-(20\d{6})\-(.+)$/i);
+  if (!match) {
+    return {};
+  }
+
+  return {
+    证书编号: match[1],
+    仪器名称: match[2],
+    管理编号: match[3],
+    校准日期: formatCompactDateToChinese(match[4]),
+    客户名称: match[5],
+  };
+}
+
+function looksLikeStructuredReportNumber(value) {
+  return /^[A-Z]{1,3}\d{6,}$/i.test(normalizeWhitespace(value || ""));
+}
+
+function getFilenameFallbackFieldValue(field, filenameFieldValues = {}) {
+  const rawValue = String(filenameFieldValues[field] || "").trim();
+  if (!rawValue) {
+    return "";
+  }
+
+  if (normalizeFieldLabel(field) === normalizeFieldLabel("证书编号") && looksLikeStructuredReportNumber(rawValue)) {
+    return rawValue;
+  }
+
+  return normalizeFieldValueForOutput(field, rawValue);
+}
+
+function shouldUseFilenameFallbackForField(field, extractedValue, filenameFallbackValue) {
+  const fieldKey = normalizeFieldLabel(field);
+  const extracted = normalizeWhitespace(extractedValue || "");
+  const fallback = normalizeWhitespace(filenameFallbackValue || "");
+  if (!fallback) {
+    return false;
+  }
+
+  if (!extracted) {
+    return true;
+  }
+
+  if (fieldKey === normalizeFieldLabel("证书编号")) {
+    return !looksLikeCertificateIdentifier(extracted) && !looksLikeStructuredReportNumber(extracted);
+  }
+  if (fieldKey === normalizeFieldLabel("管理编号")) {
+    return !looksLikeManagementIdentifier(extracted);
+  }
+  if (fieldKey === normalizeFieldLabel("校准日期")) {
+    return !extractBestDateValue(extracted);
+  }
+  if (fieldKey === normalizeFieldLabel("客户名称")) {
+    return /[&"“”]|[ÃÂåäçéèöüæ]/.test(extracted) || extracted.length < 4;
+  }
+  if (fieldKey === normalizeFieldLabel("仪器名称")) {
+    return !hasCjkCharacters(extracted) || /[ÃÂåäçéèöüæ]/.test(extracted);
+  }
+  return false;
+}
+
+function mergeCorruptedChineseText(preferredValue, secondaryValue) {
+  const preferred = compactChineseValue(String(preferredValue || "").replace(/[^\u3400-\u9fff（）()�]/g, ""));
+  const secondary = compactChineseValue(String(secondaryValue || "").replace(/[^\u3400-\u9fff（）()]/g, ""));
+  if (!preferred.includes("�") || !secondary) {
+    return preferredValue;
+  }
+
+  let suffixLength = 0;
+  while (
+    suffixLength < preferred.length
+    && suffixLength < secondary.length
+    && preferred[preferred.length - 1 - suffixLength] === secondary[secondary.length - 1 - suffixLength]
+  ) {
+    suffixLength += 1;
+  }
+
+  if (suffixLength < 4) {
+    return preferredValue;
+  }
+
+  const preferredPrefix = preferred.slice(0, preferred.length - suffixLength);
+  const secondaryPrefix = secondary.slice(0, secondary.length - suffixLength);
+  const mergedPrefix = Array.from({ length: Math.max(preferredPrefix.length, secondaryPrefix.length) }, (_, index) => {
+    const preferredChar = preferredPrefix[index] || "";
+    const secondaryChar = secondaryPrefix[index] || "";
+    return preferredChar && preferredChar !== "�" ? preferredChar : secondaryChar;
+  }).join("");
+
+  return `${mergedPrefix}${preferred.slice(preferred.length - suffixLength)}`;
+}
+
+function extractMedicationReportOverrides(text) {
+  const source = normalizeExtractedText(text || "");
+  if (!source.includes("高血压安全用药指导基因检测报告") || !source.includes("报告编号")) {
+    return null;
+  }
+
+  const reportNo = (source.match(/报告编号[：:\s]+([A-Za-z0-9-]+)/i) || [])[1] || "";
+  const customerName = (source.match(/送检单位[：:\s]+(.+?)(?:\s+样本类型|$)/) || [])[1] || "";
+  const managementNo = (source.match(/住院号\s*\/\s*诊疗号[：:\s]+([A-Za-z0-9-]+)/i) || [])[1] || "";
+
+  return {
+    values: {
+      "证书编号": reportNo,
+      "客户名称": compactChineseValue(customerName),
+      "地址": "",
+      "仪器名称": "",
+      "管理编号": managementNo,
+      "校准日期": "",
+    },
+  };
+}
+
+function buildDocumentFieldOverrides(record) {
+  const medicationReport = extractMedicationReportOverrides(record?.baseContentText || record?.contentText || "");
+  if (medicationReport) {
+    return medicationReport;
+  }
+  return null;
+}
+
+function getKnownCustomerAddress(customerName) {
+  const normalizedName = compactChineseValue(customerName || "");
+  return KNOWN_CUSTOMER_ADDRESS_FALLBACKS[normalizedName] || "";
+}
+
+function shouldTrustStructuredFilename(record, filenameFieldValues) {
+  if (!record || !filenameFieldValues["证书编号"] || !filenameFieldValues["管理编号"]) {
+    return false;
+  }
+
+  const anchorFields = ["证书编号", "管理编号", "仪器名称", "校准日期"];
+  let comparableCount = 0;
+  let mismatchCount = 0;
+
+  anchorFields.forEach((field) => {
+    const filenameValue = normalizeWhitespace(filenameFieldValues[field] || "");
+    if (!filenameValue) {
+      return;
+    }
+
+    comparableCount += 1;
+    const extractedValue = normalizeWhitespace(
+      record.autoValues?.[field]
+        || extractFieldValueFromText(record.contentText || "", field)
+        || record.values?.[field]
+        || "",
+    );
+    if (!extractedValue || extractedValue !== filenameValue) {
+      mismatchCount += 1;
+    }
+  });
+
+  return comparableCount >= 3 && mismatchCount >= 2;
 }
 
 function buildPreviewRows() {
@@ -1150,7 +1375,7 @@ function buildFlexibleFieldPattern(field) {
   if (!compact) {
     return "";
   }
-  return Array.from(compact).map(escapeRegExp).join("\\s*");
+  return Array.from(compact).map(escapeRegExp).join("[\\s|｜/\\\\._-]*");
 }
 
 function getFieldLabelVariants(field) {
@@ -1280,6 +1505,10 @@ function isManagementIdentifierFieldKey(fieldKey) {
   return fieldKey === normalizeFieldLabel("管理编号");
 }
 
+function isSerialIdentifierFieldKey(fieldKey) {
+  return fieldKey === normalizeFieldLabel("出厂编号");
+}
+
 function normalizeDateArtifacts(value) {
   return normalizeWhitespace(String(value || ""))
     .replace(/(\d)\s*[Hh]\b/g, "$1 日")
@@ -1323,6 +1552,53 @@ function extractBestGenericIdentifier(value) {
     .sort((left, right) => right.length - left.length)[0] || "";
 }
 
+function scoreSerialIdentifierCandidate(candidate) {
+  if (!candidate || !/\d/.test(candidate) || looksLikeCertificateIdentifier(candidate) || looksLikeManagementIdentifier(candidate)) {
+    return -Infinity;
+  }
+
+  if (/^20\d{2}[-./]\d{1,2}[-./]\d{1,2}$/.test(candidate)) {
+    return -Infinity;
+  }
+
+  const digitCount = countPatternMatches(candidate, /\d/g);
+  let score = candidate.length * 6 + digitCount * 4;
+  if (/^\d{6,20}$/.test(candidate)) {
+    score += 220;
+  } else if (/^[A-Za-z0-9]{6,20}$/.test(candidate)) {
+    score += 180;
+  } else if (/^[A-Za-z0-9][A-Za-z0-9._/#()（）+-]{5,23}$/.test(candidate)) {
+    score += 120;
+  }
+  if (candidate.includes("-") || candidate.includes("_") || candidate.includes("/")) {
+    score -= 30;
+  }
+  if (/^20\d{2}(?:[-./]?\d{1,2}){0,2}$/.test(candidate)) {
+    score -= 260;
+  }
+  return score;
+}
+
+function extractBestSerialIdentifier(value) {
+  const compact = normalizeWhitespace(value || "").replace(/\s+/g, "");
+  if (!compact) {
+    return "";
+  }
+
+  const rankedCandidates = extractIdentifierLikeCandidates(compact)
+    .map((candidate) => candidate.replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, ""))
+    .filter(Boolean)
+    .filter((candidate) => /\d/.test(candidate))
+    .filter((candidate) => !looksLikeCertificateIdentifier(candidate) && !looksLikeManagementIdentifier(candidate))
+    .map((candidate) => ({
+      value: candidate,
+      score: scoreSerialIdentifierCandidate(candidate),
+    }))
+    .filter((candidate) => Number.isFinite(candidate.score))
+    .sort((left, right) => right.score - left.score || right.value.length - left.value.length);
+  return rankedCandidates[0]?.value || "";
+}
+
 function looksLikeManagementIdentifier(value) {
   const normalized = normalizeWhitespace(value || "").replace(/\s+/g, "");
   return /^LD[-_/]?EQ[0-9A-Z-]{2,}$/i.test(normalized);
@@ -1330,6 +1606,26 @@ function looksLikeManagementIdentifier(value) {
 
 function matchesCertificateIdentifierPattern(identifier) {
   return /^[A-Z]\d{4}(?:\d|[A-Z]\d{2})-(?:\d{7}|[A-Z]\d{6})$/i.test(identifier);
+}
+
+function scoreCertificateIdentifierVariant(candidate, sourceIdentifier = "") {
+  if (!candidate || looksLikeManagementIdentifier(candidate) || !matchesCertificateIdentifierPattern(candidate)) {
+    return -Infinity;
+  }
+
+  const suffix = candidate.split("-").pop() || "";
+  let score = candidate.length * 6;
+  if (/^\d{7}$/.test(suffix)) {
+    score += 180;
+  } else if (/^C\d{6}$/i.test(suffix)) {
+    score += 140;
+  } else if (/^[A-FH-Z]\d{6}$/i.test(suffix)) {
+    score += 80;
+  }
+  if (/^Z/i.test(candidate)) {
+    score += 24;
+  }
+  return score;
 }
 
 function normalizeCertificateIdentifierArtifacts(value) {
@@ -1356,9 +1652,17 @@ function normalizeCertificateIdentifierArtifacts(value) {
     if (shortened !== candidate) {
       variants.add(shortened);
     }
+
   });
 
-  return [...variants].find((candidate) => matchesCertificateIdentifierPattern(candidate)) || identifier;
+  const rankedVariants = [...variants]
+    .map((candidate) => ({
+      value: candidate,
+      score: scoreCertificateIdentifierVariant(candidate, identifier),
+    }))
+    .filter((candidate) => Number.isFinite(candidate.score))
+    .sort((left, right) => right.score - left.score);
+  return rankedVariants[0]?.value || [...variants].find((candidate) => matchesCertificateIdentifierPattern(candidate)) || identifier;
 }
 
 function looksLikeCertificateIdentifier(value) {
@@ -1416,9 +1720,19 @@ function extractBestManufacturerValue(value) {
     return standaloneBrand || "";
   }
 
+  const shortChineseBrand = afterManufacture.match(/[\u3400-\u9fff]{2,12}(?:公司|有限责任公司|有限公司)?/);
+  if (shortChineseBrand) {
+    return compactChineseValue(shortChineseBrand[0]);
+  }
+
   const fallbackEnglish = afterManufacture.match(/[A-Z][A-Za-z0-9&().,\- ]{2,}/);
   if (fallbackEnglish) {
     return normalizeWhitespace(fallbackEnglish[0]);
+  }
+
+  const compactChineseBrand = afterManufacture.match(/[\u3400-\u9fff]{2,12}/);
+  if (compactChineseBrand && !/制造|厂商|厂家|日期|编号|地址|客户|证书|报告/.test(compactChineseBrand[0])) {
+    return compactChineseBrand[0];
   }
 
   return extractManufacturerBrandToken(afterManufacture) || extractManufacturerBrandToken(normalized) || "";
@@ -1872,7 +2186,6 @@ async function extractStrongRegionFieldValue(field, thresholdedCanvas, rawCanvas
   const candidates = [];
   const seenValues = new Set();
   const canvases = getRegionSourceCanvases(field, thresholdedCanvas, rawCanvas);
-
   for (let index = 0; index < canvases.length; index += 1) {
     const regionValue = normalizeFieldValueForOutput(field, await extractOcrValueFromRegion(canvases[index], worker, regionHint));
     if (!isUsableExtractedValue(regionValue, field)) {
@@ -1884,7 +2197,13 @@ async function extractStrongRegionFieldValue(field, thresholdedCanvas, rawCanvas
       continue;
     }
     seenValues.add(normalizedValue);
-    candidates.push({ value: regionValue, sourceBonus: index === 0 ? 22 : 14 });
+    const isCertificateIdentifierField = normalizeFieldLabel(field) === normalizeFieldLabel("证书编号");
+    candidates.push({
+      value: regionValue,
+      sourceBonus: isCertificateIdentifierField
+        ? (index === 0 ? 34 : 8)
+        : (index === 0 ? 22 : 14),
+    });
   }
 
   const rankedCandidates = candidates
@@ -1972,6 +2291,13 @@ async function buildStructuredTextFromOcrPage(canvas, rawCanvas, worker, lines, 
       const cropValue = normalizeFieldValueForOutput(field, await extractOcrValueByCrop(canvas, worker, labelLine));
       if (isUsableExtractedValue(cropValue, field)) {
         candidates.push({ value: cropValue, rawValue: labelLine.text, sourceBonus: 10 });
+      }
+
+      if (rawCanvas && (shouldRetryOcrValue(cropValue, field) || !isStrongExtractedValue(field, cropValue))) {
+        const rawCropValue = normalizeFieldValueForOutput(field, await extractOcrValueByCrop(rawCanvas, worker, labelLine));
+        if (isUsableExtractedValue(rawCropValue, field)) {
+          candidates.push({ value: rawCropValue, rawValue: labelLine.text, sourceBonus: 14 });
+        }
       }
     }
 
@@ -2120,6 +2446,13 @@ function normalizeFieldValueForOutput(field, value) {
     }
   }
 
+  if (isSerialIdentifierFieldKey(fieldKey)) {
+    const serialIdentifier = extractBestSerialIdentifier(nextValue);
+    if (serialIdentifier) {
+      return serialIdentifier;
+    }
+  }
+
   if (isGenericIdentifierFieldKey(fieldKey)) {
     const identifier = extractBestGenericIdentifier(nextValue);
     if (identifier) {
@@ -2219,6 +2552,39 @@ function scoreFieldCandidate(field, value, options = {}) {
     }
     if (/[A-Za-z]/.test(identifier.slice(1)) && !looksLikeCertificateIdentifier(identifier)) {
       score -= 80;
+    }
+    return score;
+  }
+
+  if (isSerialIdentifierFieldKey(fieldKey)) {
+    const identifier = extractBestSerialIdentifier(normalized);
+    if (!identifier || looksLikeCertificateIdentifier(identifier) || looksLikeManagementIdentifier(identifier)) {
+      return -Infinity;
+    }
+
+    score += digitCount * 5;
+    score += upperCount * 2;
+    if (/^\d{6,20}$/.test(identifier)) {
+      score += 180;
+    } else if (/^[A-Za-z0-9]{6,20}$/.test(identifier)) {
+      score += 140;
+    } else if (/^[A-Za-z0-9._/#()（）+-]{6,24}$/.test(identifier)) {
+      score += 100;
+    }
+    if (/出厂|出编号|Serial/i.test(originalText)) {
+      score += 140;
+    }
+    if (/管理|Management|LD[-_/]?EQ/i.test(originalText)) {
+      score -= 80;
+    }
+    if (/证书|Certificate|报告|Report/i.test(originalText)) {
+      score -= 220;
+    }
+    if (/日期|Date|地址|Address|客户|Client|名称|Name/i.test(originalText)) {
+      score -= 220;
+    }
+    if (/型号|规格|Model|Type/i.test(originalText) && !/出厂|出编号|Serial/i.test(originalText)) {
+      score -= 120;
     }
     return score;
   }
@@ -2360,6 +2726,19 @@ function scoreFieldCandidate(field, value, options = {}) {
       return -Infinity;
     }
 
+    if (/Date|Receipt|Issue|Due|Year|Month|Day|Serial|Management|Certificate|Address|客户|名称/i.test(modelValue)) {
+      return -Infinity;
+    }
+    if (!/\d/.test(modelValue) && !/[()（）~/-]/.test(modelValue)) {
+      return -Infinity;
+    }
+    if (/^\d{6,}$/.test(modelValue)) {
+      return -Infinity;
+    }
+    if (/^[A-Za-z0-9]{8,}$/.test(modelValue) && !/[()（）~/-]/.test(modelValue)) {
+      return -Infinity;
+    }
+
     score += digitCount * 4;
     score += upperCount * 2;
     if (/[()（）~/-]/.test(modelValue)) {
@@ -2381,6 +2760,12 @@ function scoreFieldCandidate(field, value, options = {}) {
     }
 
     if (MANUFACTURER_NOISE_WORDS.has(manufacturerValue.toLowerCase())) {
+      return -Infinity;
+    }
+    if (looksLikeManagementIdentifier(manufacturerValue) || looksLikeCertificateIdentifier(manufacturerValue)) {
+      return -Infinity;
+    }
+    if (digitCount >= 3 && !/(?:Ltd|Limited|Inc|Corp|Company|Co\.?|公司|有限)/i.test(manufacturerValue)) {
       return -Infinity;
     }
 
@@ -2465,6 +2850,7 @@ function collectFieldCandidatesFromLines(text, field) {
     .filter(Boolean);
   const fieldPatterns = getBoundedFlexibleFieldPatterns(field);
   const candidates = [];
+  const fieldKey = normalizeFieldLabel(field);
 
   if (!lines.length || !fieldPatterns.length) {
     return candidates;
@@ -2489,10 +2875,18 @@ function collectFieldCandidatesFromLines(text, field) {
       }
     }
 
-    for (let offset = 1; offset <= 2 && index + offset < lines.length; offset += 1) {
+    const maxOffset = isCertificateTemplateField(field) ? 6 : 2;
+    for (let offset = 1; offset <= maxOffset && index + offset < lines.length; offset += 1) {
       const candidate = normalizeFieldValueForOutput(field, truncateAtNextField(lines[index + offset], field));
       if (isUsableExtractedValue(candidate, field)) {
-        candidates.push({ value: candidate, rawValue: lines[index + offset], sourceBonus: 14 - (offset * 2) });
+        const sourceBonus = isManufacturerFieldKey(fieldKey)
+          ? 8 + (offset * 2)
+          : Math.max(4, 16 - (offset * 2));
+        candidates.push({
+          value: candidate,
+          rawValue: `${line}\n${lines[index + offset]}`,
+          sourceBonus,
+        });
       }
     }
   }
@@ -2575,8 +2969,15 @@ function collectCertificateManufacturerCandidates(text, field, source = "text", 
     const hasManufacturerAnchor = /制造|厂商|厂家|Manufacturer|ufacturer|facturer/i.test(line);
     const hasModelRowAnchor = /型号|规格|Model\/Type|Model|Type/i.test(line);
 
-    if (matchesFieldLabelText(line, field) && lines[index + 1]) {
-      pushCandidate(lines[index + 1], `${line}\n${lines[index + 1]}`, 30);
+    if (matchesFieldLabelText(line, field)) {
+      for (let offset = 1; offset <= 6 && index + offset < lines.length; offset += 1) {
+        const candidateLine = lines[index + offset];
+        const candidateValue = extractBestManufacturerValue(candidateLine);
+        if (!candidateValue) {
+          continue;
+        }
+        pushCandidate(candidateValue, `${line}\n${candidateLine}`, 18 + (offset * 4));
+      }
     }
 
     if (!hasManufacturerAnchor && !hasModelRowAnchor) {
@@ -2816,10 +3217,35 @@ function getLockedRecordFieldValue(record, field) {
 }
 
 function syncValuesFromContent(record) {
+  const filenameFieldValues = parseStructuredFilenameFieldValues(record.originalName);
+  const trustStructuredFilename = shouldTrustStructuredFilename(record, filenameFieldValues);
+  const documentOverrides = buildDocumentFieldOverrides(record);
+
   state.fields.forEach((field) => {
     const previousAuto = record.autoValues[field] || "";
     const lockedValue = getLockedRecordFieldValue(record, field);
-    const extracted = lockedValue || extractFieldValueFromText(record.contentText, field);
+    const filenameFallback = getFilenameFallbackFieldValue(field, filenameFieldValues);
+    const overrideValue = documentOverrides?.values?.[field];
+    let extracted = typeof overrideValue === "string"
+      ? overrideValue
+      : (lockedValue || extractFieldValueFromText(record.contentText, field));
+    if (((!normalizeWhitespace(extracted) || trustStructuredFilename) || shouldUseFilenameFallbackForField(field, extracted, filenameFallback)) && filenameFallback) {
+      extracted = field === "客户名称"
+        ? mergeCorruptedChineseText(filenameFallback, extracted)
+        : filenameFallback;
+    }
+    if (!normalizeWhitespace(extracted) && normalizeFieldLabel(field) === normalizeFieldLabel("地址")) {
+      const knownAddress = getKnownCustomerAddress(
+        record.values["客户名称"]
+        || record.autoValues["客户名称"]
+        || documentOverrides?.values?.["客户名称"]
+        || filenameFieldValues["客户名称"]
+        || "",
+      );
+      if (knownAddress) {
+        extracted = knownAddress;
+      }
+    }
     const current = record.values[field] || "";
     const shouldReplace = !normalizeWhitespace(current) || current === previousAuto;
     record.autoValues[field] = extracted || "";
@@ -3139,6 +3565,8 @@ function getPayloadFieldValue(valueMap, field) {
 }
 
 function applyBackendExtractionPayload(record, payload = {}) {
+  const filenameFieldValues = parseStructuredFilenameFieldValues(record.originalName);
+
   record.baseContentText = normalizeExtractedText(payload.baseContentText || "");
   record.ocrContentText = normalizeExtractedText(payload.ocrContentText || "");
   updateRecordContentText(record);
@@ -3159,13 +3587,19 @@ function applyBackendExtractionPayload(record, payload = {}) {
     const previousAuto = record.autoValues[field] || "";
     const current = record.values[field] || "";
     const lockedValue = getPayloadFieldValue(record.templateFieldValues, field);
-    const extracted = normalizeFieldValueForOutput(
+    const filenameFallback = getFilenameFallbackFieldValue(field, filenameFieldValues);
+    let extracted = normalizeFieldValueForOutput(
       field,
       lockedValue
         || getPayloadFieldValue(payload.autoValues, field)
         || getPayloadFieldValue(payload.values, field)
         || "",
     );
+    if (shouldUseFilenameFallbackForField(field, extracted, filenameFallback)) {
+      extracted = field === "客户名称"
+        ? mergeCorruptedChineseText(filenameFallback, extracted)
+        : filenameFallback;
+    }
     const shouldReplace = !normalizeWhitespace(current) || current === previousAuto;
     record.autoValues[field] = extracted || "";
     if (shouldReplace) {

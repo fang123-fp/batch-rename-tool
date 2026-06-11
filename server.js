@@ -1,33 +1,72 @@
-const http = require('http');
+const express = require('express');
 const fs = require('fs');
-const path = require('path');
+const fsp = fs.promises;
+const multer = require('multer');
 const os = require('os');
+const path = require('path');
+const { spawnSync } = require('child_process');
+const puppeteer = require('puppeteer-core');
 
 const host = process.env.HOST || '0.0.0.0';
 const port = Number(process.env.PORT || 8123);
 const rootDir = __dirname;
 const baseDir = path.resolve(rootDir);
+const tempRootDir = path.join(baseDir, '.tmp');
+const maxUploadFiles = Number(process.env.MAX_UPLOAD_FILES || 200);
+const maxUploadFileSize = Number(process.env.MAX_UPLOAD_FILE_SIZE || 50 * 1024 * 1024);
 
-const contentTypes = {
-  '.html': 'text/html; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.js': 'application/javascript; charset=utf-8',
-  '.mjs': 'application/javascript; charset=utf-8',
-  '.json': 'application/json; charset=utf-8',
-  '.txt': 'text/plain; charset=utf-8',
-  '.md': 'text/markdown; charset=utf-8',
-  '.ico': 'image/x-icon',
-  '.svg': 'image/svg+xml',
-};
+let browserPromise = null;
 
-function resolveRequestPath(urlPath) {
-  const decodedPath = decodeURIComponent(urlPath.split('?')[0]);
-  const trimmed = decodedPath === '/' ? '/index.html' : decodedPath;
-  const fullPath = path.resolve(baseDir, `.${trimmed}`);
-  if (!fullPath.startsWith(baseDir)) {
-    return null;
+function formatErrorMessage(error) {
+  if (error && typeof error.message === 'string' && error.message.trim()) {
+    return error.message.trim();
   }
-  return fullPath;
+  if (typeof error === 'string' && error.trim()) {
+    return error.trim();
+  }
+  return '未知错误';
+}
+
+function buildWorkerUrl() {
+  const workerUrl = new URL(`http://127.0.0.1:${port}/`);
+  workerUrl.searchParams.set('backend', 'off');
+  workerUrl.searchParams.set('serverWorker', '1');
+  workerUrl.searchParams.set('v', String(Date.now()));
+  return workerUrl.href;
+}
+
+function buildTemplateFromFields(fields) {
+  if (!Array.isArray(fields) || !fields.length) {
+    return '{姓名}-{编号}';
+  }
+  return fields.map((field) => `{${String(field || '').trim()}}`).join('-');
+}
+
+function sanitizeUploadName(filename) {
+  const basename = path.basename(filename || 'upload.bin');
+  return basename.replace(/[\\/:*?"<>|]/g, '-').replace(/\s+/g, ' ').trim() || 'upload.bin';
+}
+
+function safeJsonParse(value, fallback) {
+  if (typeof value !== 'string') {
+    return fallback;
+  }
+  try {
+    return JSON.parse(value);
+  } catch (_error) {
+    return fallback;
+  }
+}
+
+async function ensureDirectory(dirPath) {
+  await fsp.mkdir(dirPath, { recursive: true });
+}
+
+async function removeDirectory(dirPath) {
+  if (!dirPath) {
+    return;
+  }
+  await fsp.rm(dirPath, { recursive: true, force: true });
 }
 
 function getNetworkUrls() {
@@ -43,32 +82,319 @@ function getNetworkUrls() {
   return [...new Set(urls)];
 }
 
-const server = http.createServer((request, response) => {
-  const targetPath = resolveRequestPath(request.url || '/');
-  if (!targetPath) {
-    response.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
-    response.end('Forbidden');
-    return;
+function findExecutableInPath(command) {
+  const whichCommand = process.platform === 'win32' ? 'where' : 'which';
+  const result = spawnSync(whichCommand, [command], { encoding: 'utf8' });
+  if (result.status !== 0) {
+    return '';
+  }
+  const firstLine = String(result.stdout || '').split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+  return firstLine || '';
+}
+
+function getBrowserCandidates() {
+  const candidates = [
+    { name: 'Env Chrome', executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '' },
+    { name: 'Env Chrome', executablePath: process.env.CHROME_PATH || '' },
+    { name: 'Google Chrome (macOS)', executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' },
+    { name: 'Google Chrome Canary (macOS)', executablePath: '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary' },
+    { name: 'Microsoft Edge (macOS)', executablePath: '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge' },
+    { name: 'Google Chrome (Windows)', executablePath: path.join(process.env.PROGRAMFILES || '', 'Google/Chrome/Application/chrome.exe') },
+    { name: 'Google Chrome (Windows x86)', executablePath: path.join(process.env['PROGRAMFILES(X86)'] || '', 'Google/Chrome/Application/chrome.exe') },
+    { name: 'Google Chrome (Windows Local)', executablePath: path.join(process.env.LOCALAPPDATA || '', 'Google/Chrome/Application/chrome.exe') },
+    { name: 'Microsoft Edge (Windows)', executablePath: path.join(process.env.PROGRAMFILES || '', 'Microsoft/Edge/Application/msedge.exe') },
+    { name: 'Microsoft Edge (Windows x86)', executablePath: path.join(process.env['PROGRAMFILES(X86)'] || '', 'Microsoft/Edge/Application/msedge.exe') },
+    { name: 'Google Chrome (Linux)', executablePath: '/usr/bin/google-chrome' },
+    { name: 'Google Chrome Stable (Linux)', executablePath: '/usr/bin/google-chrome-stable' },
+    { name: 'Chromium Browser (Linux)', executablePath: '/usr/bin/chromium-browser' },
+    { name: 'Chromium (Linux)', executablePath: '/usr/bin/chromium' },
+    { name: 'Google Chrome (PATH)', executablePath: findExecutableInPath('google-chrome') },
+    { name: 'Google Chrome Stable (PATH)', executablePath: findExecutableInPath('google-chrome-stable') },
+    { name: 'Chromium (PATH)', executablePath: findExecutableInPath('chromium') },
+    { name: 'Chromium Browser (PATH)', executablePath: findExecutableInPath('chromium-browser') },
+    { name: 'Microsoft Edge (PATH)', executablePath: findExecutableInPath('msedge') },
+  ];
+
+  return candidates.filter((candidate) => candidate.executablePath);
+}
+
+function resolveBrowserLaunchOptions() {
+  const match = getBrowserCandidates().find((candidate) => fs.existsSync(candidate.executablePath));
+  if (!match) {
+    throw new Error('未找到可用的 Chrome / Edge 浏览器，请安装桌面浏览器，或设置 PUPPETEER_EXECUTABLE_PATH');
   }
 
-  fs.stat(targetPath, (statError, stat) => {
-    if (statError || !stat.isFile()) {
-      response.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-      response.end('Not Found');
+  return {
+    browserName: match.name,
+    executablePath: match.executablePath,
+    launchOptions: {
+      executablePath: match.executablePath,
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--font-render-hinting=medium',
+      ],
+    },
+  };
+}
+
+async function getBrowser() {
+  if (!browserPromise) {
+    const { launchOptions } = resolveBrowserLaunchOptions();
+    browserPromise = puppeteer.launch(launchOptions).catch((error) => {
+      browserPromise = null;
+      throw error;
+    });
+  }
+  return browserPromise;
+}
+
+async function closeBrowser() {
+  if (!browserPromise) {
+    return;
+  }
+  try {
+    const browser = await browserPromise;
+    await browser.close();
+  } catch (_error) {
+    // Ignore shutdown errors.
+  } finally {
+    browserPromise = null;
+  }
+}
+
+async function extractFilesWithBrowser(options) {
+  const {
+    files,
+    fields,
+    recordIds,
+    requestOptions,
+  } = options;
+  const browser = await getBrowser();
+  const page = await browser.newPage();
+  const workerUrl = buildWorkerUrl();
+  const timeoutMs = Math.max(180000, Math.min(1800000, files.length * 60000));
+
+  page.setDefaultTimeout(timeoutMs);
+  page.setDefaultNavigationTimeout(timeoutMs);
+  await page.setViewport({ width: 1440, height: 1200, deviceScaleFactor: 1 });
+  await page.setCacheEnabled(false);
+  page.on('pageerror', (error) => {
+    console.error('Worker page error:', formatErrorMessage(error));
+  });
+
+  try {
+    await page.goto(workerUrl, { waitUntil: 'networkidle2' });
+    await page.waitForSelector('#fileInput');
+
+    await page.evaluate(({ workerFields, workerTemplate }) => {
+      state.fields = [...workerFields];
+      state.pendingFields = [];
+      state.files = [];
+      state.template = workerTemplate;
+      state.status = '服务端工作页初始化完成';
+      state.statusKind = '';
+      state.isExtracting = false;
+      state.extractionRunId = 0;
+      state.activeExtractionPromise = null;
+      state.pendingExtractionRequest = null;
+      state.focusPendingFieldId = '';
+      state.backendStatus = 'disabled';
+      state.backendMessage = '服务端工作页已禁用本地后端递归调用';
+      ocrQueueTail = Promise.resolve();
+      activeOcrJobCount = 0;
+      waitingOcrJobCount = 0;
+      fileInput.value = '';
+      templateInput.value = state.template;
+      render();
+    }, {
+      workerFields: fields,
+      workerTemplate: buildTemplateFromFields(fields),
+    });
+
+    const input = await page.$('#fileInput');
+    if (!input) {
+      throw new Error('服务端工作页缺少文件上传输入框');
+    }
+
+    await input.uploadFile(...files.map((file) => file.path));
+    await page.waitForFunction((expectedCount) => state.files.length === expectedCount, {}, files.length);
+    await page.waitForFunction((expectedCount) => (
+      state.files.length === expectedCount
+      && !state.isExtracting
+      && !state.activeExtractionPromise
+      && state.files.every((record) => record.contentState !== 'reading')
+    ), { timeout: timeoutMs }, files.length);
+
+    const snapshot = await page.evaluate(() => buildDiagnosticsSnapshot());
+    const rows = Array.isArray(snapshot?.records) ? snapshot.records : [];
+
+    return rows.map((row, index) => ({
+      recordId: recordIds[index] || '',
+      originalName: files[index]?.originalname || row.originalName || '',
+      contentState: row.contentState,
+      contentMessage: row.contentMessage,
+      contentTypeLabel: row.contentTypeLabel,
+      ocrAttempted: Boolean(row.ocrAttempted),
+      documentProfile: row.documentProfile || '',
+      values: row.values || {},
+      autoValues: row.autoValues || {},
+      templateFieldValues: row.templateFieldValues || {},
+      baseContentText: row.baseContentText || '',
+      ocrContentText: row.ocrContentText || '',
+      contentText: row.contentText || '',
+      templateDiagnostics: row.templateDiagnostics || null,
+      workerBackendStatus: snapshot.backendStatus || '',
+      workerBackendMessage: snapshot.backendMessage || '',
+      requestedStrictCertificateMode: Boolean(requestOptions?.strictCertificateMode),
+    }));
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+
+const app = express();
+
+app.disable('x-powered-by');
+app.use((request, response, next) => {
+  response.setHeader('Cache-Control', 'no-store');
+  next();
+});
+app.use(express.static(baseDir, {
+  index: false,
+  extensions: ['html'],
+  setHeaders(response) {
+    response.setHeader('Cache-Control', 'no-store');
+  },
+}));
+
+app.get('/api/health', async (_request, response) => {
+  try {
+    const browserInfo = resolveBrowserLaunchOptions();
+    response.json({
+      ok: true,
+      message: `本地后端已就绪，当前使用 ${browserInfo.browserName}`,
+      browserName: browserInfo.browserName,
+      executablePath: browserInfo.executablePath,
+      appVersion: '20260610-localbackend1',
+    });
+  } catch (error) {
+    response.status(503).json({
+      ok: false,
+      message: formatErrorMessage(error),
+    });
+  }
+});
+
+const uploadStorage = multer.diskStorage({
+  destination(request, _file, callback) {
+    callback(null, request.uploadTempDir);
+  },
+  filename(request, file, callback) {
+    const currentIndex = request.uploadFileIndex || 0;
+    request.uploadFileIndex = currentIndex + 1;
+    callback(null, `${String(currentIndex).padStart(4, '0')}-${sanitizeUploadName(file.originalname)}`);
+  },
+});
+
+const upload = multer({
+  storage: uploadStorage,
+  limits: {
+    files: maxUploadFiles,
+    fileSize: maxUploadFileSize,
+    fieldSize: 1024 * 1024,
+  },
+});
+
+async function prepareUploadTempDir(request, _response, next) {
+  try {
+    await ensureDirectory(tempRootDir);
+    request.uploadTempDir = await fsp.mkdtemp(path.join(tempRootDir, 'upload-'));
+    request.uploadFileIndex = 0;
+    next();
+  } catch (error) {
+    next(error);
+  }
+}
+
+app.post('/api/extract', prepareUploadTempDir, upload.array('files', maxUploadFiles), async (request, response) => {
+  const fields = safeJsonParse(request.body.fields, []).map((field) => String(field || '').trim()).filter(Boolean);
+  const recordIds = safeJsonParse(request.body.recordIds, []);
+  const requestOptions = safeJsonParse(request.body.options, {});
+  const files = Array.isArray(request.files) ? request.files : [];
+
+  try {
+    if (!files.length) {
+      response.status(400).json({ ok: false, message: '没有收到要识别的文件' });
+      return;
+    }
+    if (!fields.length) {
+      response.status(400).json({ ok: false, message: '没有收到字段列表' });
       return;
     }
 
-    const ext = path.extname(targetPath).toLowerCase();
-    response.writeHead(200, {
-      'Content-Type': contentTypes[ext] || 'application/octet-stream',
-      'Cache-Control': 'no-store',
+    const extractedFiles = await extractFilesWithBrowser({
+      files,
+      fields,
+      recordIds,
+      requestOptions,
     });
-    fs.createReadStream(targetPath).pipe(response);
+
+    response.json({
+      ok: true,
+      message: `本地后端已完成 ${extractedFiles.length} 份文件的统一识别`,
+      files: extractedFiles,
+    });
+  } catch (error) {
+    console.error('Extraction API failed:', error);
+    await closeBrowser();
+    response.status(500).json({
+      ok: false,
+      message: formatErrorMessage(error),
+    });
+  } finally {
+    await removeDirectory(request.uploadTempDir);
+  }
+});
+
+app.get('/', (_request, response) => {
+  response.sendFile(path.join(baseDir, 'index.html'));
+});
+
+app.use((error, _request, response, _next) => {
+  console.error('Server error:', error);
+  response.status(500).json({
+    ok: false,
+    message: formatErrorMessage(error),
   });
 });
 
-server.listen(port, host, () => {
+const server = app.listen(port, host, async () => {
+  await ensureDirectory(tempRootDir).catch(() => {});
   console.log('Batch rename tool server is running.');
   getNetworkUrls().forEach((url) => console.log(`Open: ${url}`));
+  try {
+    const browserInfo = resolveBrowserLaunchOptions();
+    console.log(`Backend browser: ${browserInfo.browserName}`);
+    console.log(`Executable: ${browserInfo.executablePath}`);
+  } catch (error) {
+    console.warn(`Backend browser not ready: ${formatErrorMessage(error)}`);
+  }
   console.log('Press Ctrl+C to stop the server.');
+});
+
+async function shutdown(signal) {
+  console.log(`Received ${signal}, shutting down...`);
+  server.close(() => {});
+  await closeBrowser();
+  process.exit(0);
+}
+
+['SIGINT', 'SIGTERM'].forEach((signal) => {
+  process.on(signal, () => {
+    shutdown(signal).catch(() => process.exit(1));
+  });
 });

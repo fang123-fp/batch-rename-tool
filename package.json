@@ -1,0 +1,30 @@
+{
+  "name": "batch-rename-tool",
+  "version": "1.0.0",
+  "description": "本地批量重命名工具，支持前端直读和本地后端统一 PDF 识别。",
+  "main": "app.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fang123-fp/batch-rename-tool.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/fang123-fp/batch-rename-tool/issues"
+  },
+  "homepage": "https://github.com/fang123-fp/batch-rename-tool#readme",
+  "dependencies": {
+    "express": "^5.2.1",
+    "multer": "^2.1.1",
+    "puppeteer-core": "^24.43.1"
+  }
+}

@@ -10,6 +10,8 @@ const state = {
   activeExtractionPromise: null,
   pendingExtractionRequest: null,
   focusPendingFieldId: "",
+  backendStatus: "unknown",
+  backendMessage: "",
 };
 
 const TEXT_EXTENSIONS = new Set([".txt", ".csv", ".tsv", ".json", ".md", ".markdown", ".html", ".htm", ".xml"]);
@@ -166,7 +168,10 @@ let tesseractLoadPromise;
 let ocrQueueTail = Promise.resolve();
 let activeOcrJobCount = 0;
 let waitingOcrJobCount = 0;
-const STATIC_ASSET_VERSION = "20260610-certlock2";
+const STATIC_ASSET_VERSION = "20260610-localbackend1";
+const BACKEND_DISABLED_BY_QUERY = new URLSearchParams(window.location.search).get("backend") === "off";
+const BACKEND_EXTRACTABLE_EXTENSIONS = new Set([".pdf"]);
+let backendHealthPromise;
 
 function resolveAssetUrl(relativePath, options = {}) {
   const { versioned = true } = options;
@@ -246,6 +251,18 @@ function normalizeWhitespace(value) {
 
 function normalizeFieldLabel(value) {
   return String(value || "").replace(/\s+/g, "").trim();
+}
+
+function isHttpPage() {
+  return /^https?:$/i.test(window.location.protocol);
+}
+
+function canAttemptBackendExtraction() {
+  return isHttpPage() && !BACKEND_DISABLED_BY_QUERY;
+}
+
+function buildBackendApiUrl(pathname) {
+  return new URL(pathname, window.location.origin).href;
 }
 
 function createLocalId() {
@@ -856,6 +873,19 @@ function makeRecord(file) {
   };
 }
 
+function resetRecordExtractionArtifacts(record) {
+  record.contentText = "";
+  record.baseContentText = "";
+  record.ocrContentText = "";
+  record.contentTypeLabel = "";
+  record.contentState = "idle";
+  record.contentMessage = "等待读取文件内容";
+  record.ocrAttempted = false;
+  record.documentProfile = "";
+  record.templateFieldValues = {};
+  record.templateDiagnostics = null;
+}
+
 function updateRecordContentText(record) {
   record.contentText = normalizeExtractedText([record.ocrContentText, record.baseContentText].filter(Boolean).join("\n"));
 }
@@ -890,6 +920,12 @@ function applyRecordExtractionMetadata(record, metadata = {}) {
   if (metadata.templateDiagnostics) {
     mergeTemplateDiagnostics(record, metadata.templateDiagnostics);
   }
+}
+
+function replaceRecordExtractionMetadata(record, metadata = {}) {
+  record.documentProfile = metadata.documentProfile || "";
+  record.templateFieldValues = { ...(metadata.templateFieldValues || {}) };
+  record.templateDiagnostics = metadata.templateDiagnostics || null;
 }
 
 function buildStructuredFieldLinesFromText(text, fields = state.fields) {
@@ -1008,6 +1044,9 @@ function buildDiagnosticsSnapshot() {
     language: navigator.language,
     template: state.template,
     fields: [...state.fields],
+    backendStatus: state.backendStatus,
+    backendMessage: state.backendMessage,
+    backendDisabledByQuery: BACKEND_DISABLED_BY_QUERY,
     likelyCertificateFieldSelection: looksLikeCertificateFieldSelection(state.fields),
     records: previewRows.map((row) => ({
       originalName: row.originalName,
@@ -3014,16 +3053,192 @@ async function readTextFromFile(record) {
   };
 }
 
+function getPayloadFieldValue(valueMap, field) {
+  const entries = Object.entries(valueMap || {});
+  const normalizedField = normalizeFieldLabel(field);
+  if (!normalizedField || !entries.length) {
+    return "";
+  }
+
+  const directValue = valueMap?.[field];
+  if (normalizeWhitespace(directValue || "")) {
+    return directValue;
+  }
+
+  const normalizedVariants = new Set(
+    getFieldLabelVariants(field).map((variant) => normalizeFieldLabel(variant)).filter(Boolean),
+  );
+  normalizedVariants.add(normalizedField);
+
+  const matchedEntry = entries.find(([label, currentValue]) => (
+    normalizedVariants.has(normalizeFieldLabel(label)) && normalizeWhitespace(currentValue || "")
+  ));
+
+  return matchedEntry?.[1] || "";
+}
+
+function applyBackendExtractionPayload(record, payload = {}) {
+  record.baseContentText = normalizeExtractedText(payload.baseContentText || "");
+  record.ocrContentText = normalizeExtractedText(payload.ocrContentText || "");
+  updateRecordContentText(record);
+  if (normalizeExtractedText(payload.contentText || "")) {
+    record.contentText = normalizeExtractedText(payload.contentText || "");
+  }
+
+  record.contentState = payload.contentState || "ready";
+  record.contentTypeLabel = payload.contentTypeLabel || (record.extensionLower === ".pdf" ? "PDF" : record.contentTypeLabel);
+  record.ocrAttempted = Boolean(payload.ocrAttempted || record.ocrContentText);
+  replaceRecordExtractionMetadata(record, {
+    documentProfile: payload.documentProfile || "",
+    templateFieldValues: payload.templateFieldValues || {},
+    templateDiagnostics: payload.templateDiagnostics || null,
+  });
+
+  state.fields.forEach((field) => {
+    const previousAuto = record.autoValues[field] || "";
+    const current = record.values[field] || "";
+    const lockedValue = getPayloadFieldValue(record.templateFieldValues, field);
+    const extracted = normalizeFieldValueForOutput(
+      field,
+      lockedValue
+        || getPayloadFieldValue(payload.autoValues, field)
+        || getPayloadFieldValue(payload.values, field)
+        || "",
+    );
+    const shouldReplace = !normalizeWhitespace(current) || current === previousAuto;
+    record.autoValues[field] = extracted || "";
+    if (shouldReplace) {
+      record.values[field] = extracted || "";
+    }
+  });
+
+  if (record.contentState === "ready") {
+    record.contentMessage = buildExtractionMessage(record);
+    return;
+  }
+
+  record.contentMessage = payload.contentMessage || buildExtractionMessage(record);
+}
+
+function shouldUseBackendForRecord(record, options = {}) {
+  if (!record || !BACKEND_EXTRACTABLE_EXTENSIONS.has(record.extensionLower) || !canAttemptBackendExtraction()) {
+    return false;
+  }
+
+  if (options.reReadContent || !record.contentText || record.contentState === "idle" || record.contentState === "error") {
+    return true;
+  }
+
+  return record.contentState === "ready"
+    && !record.ocrAttempted
+    && getPdfOcrTargetFields(record).length > 0;
+}
+
+async function ensureBackendAvailability(force = false) {
+  if (!canAttemptBackendExtraction()) {
+    state.backendStatus = BACKEND_DISABLED_BY_QUERY ? "disabled" : "unsupported";
+    state.backendMessage = BACKEND_DISABLED_BY_QUERY
+      ? "当前页面已显式关闭本地后端"
+      : "当前页面不是 HTTP 服务，无法连接本地后端";
+    return false;
+  }
+
+  if (!force && backendHealthPromise && state.backendStatus === "online") {
+    return backendHealthPromise;
+  }
+
+  backendHealthPromise = fetch(buildBackendApiUrl("/api/health"), { cache: "no-store" })
+    .then(async (response) => {
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload?.ok) {
+        throw new Error(payload?.message || `本地后端不可用（${response.status}）`);
+      }
+
+      state.backendStatus = "online";
+      state.backendMessage = payload.message || "本地后端已连接";
+      return true;
+    })
+    .catch((error) => {
+      console.warn("Backend health check failed:", error);
+      state.backendStatus = "offline";
+      state.backendMessage = formatErrorMessage(error);
+      backendHealthPromise = null;
+      return false;
+    });
+
+  return backendHealthPromise;
+}
+
+async function extractRecordsWithBackend(records, options = {}, runId = state.extractionRunId) {
+  if (!records.length) {
+    return new Set();
+  }
+
+  const formData = new FormData();
+  formData.append("fields", JSON.stringify(state.fields));
+  formData.append("recordIds", JSON.stringify(records.map((record) => record.id)));
+  formData.append("options", JSON.stringify({
+    reReadContent: Boolean(options.reReadContent),
+    strictCertificateMode: true,
+  }));
+  records.forEach((record) => {
+    formData.append("files", record.file, record.originalName);
+  });
+
+  try {
+    const response = await fetch(buildBackendApiUrl("/api/extract"), {
+      method: "POST",
+      body: formData,
+      cache: "no-store",
+    });
+    const payload = await response.json().catch(() => ({}));
+
+    if (!response.ok || !payload?.ok) {
+      throw new Error(payload?.message || `本地后端读取失败（${response.status}）`);
+    }
+
+    const returnedFiles = Array.isArray(payload.files) ? payload.files : [];
+    const payloadByRecordId = new Map();
+    returnedFiles.forEach((item, index) => {
+      const recordId = item?.recordId || records[index]?.id;
+      if (recordId) {
+        payloadByRecordId.set(recordId, item);
+      }
+    });
+
+    const handledRecordIds = new Set();
+    records.forEach((record, index) => {
+      const item = payloadByRecordId.get(record.id) || returnedFiles[index];
+      if (!item) {
+        return;
+      }
+      applyBackendExtractionPayload(record, item);
+      handledRecordIds.add(record.id);
+    });
+
+    state.backendStatus = "online";
+    state.backendMessage = payload.message || "本地后端读取完成";
+    if (runId === state.extractionRunId) {
+      renderDataViews();
+    }
+    return handledRecordIds;
+  } catch (error) {
+    console.error("Backend extraction failed:", error);
+    state.backendStatus = "error";
+    state.backendMessage = formatErrorMessage(error);
+    return new Set();
+  }
+}
+
 async function populateRecordFromContent(record, options = {}) {
   const { reReadContent = false } = options;
+  if (reReadContent) {
+    resetRecordExtractionArtifacts(record);
+  }
   record.contentState = "reading";
   record.contentMessage = "正在读取文件内容...";
 
   try {
-    if (reReadContent) {
-      record.ocrAttempted = false;
-    }
-
     if (reReadContent || !record.contentText || record.contentState === "idle") {
       const result = await readTextFromFile(record);
       record.baseContentText = normalizeExtractedText(result.text || "");
@@ -3093,12 +3308,24 @@ async function runAutoExtraction(records = state.files, options = {}) {
   const runId = ++state.extractionRunId;
   state.isExtracting = true;
   records.forEach((record) => {
+    if (options.reReadContent) {
+      resetRecordExtractionArtifacts(record);
+    }
     record.contentState = "reading";
-    record.contentMessage = "正在读取文件内容...";
+    record.contentMessage = shouldUseBackendForRecord(record, options)
+      ? "正在通过本地后端读取 PDF 内容..."
+      : "正在读取文件内容...";
   });
   renderDataViews();
 
-  await Promise.all(records.map(async (record) => {
+  const backendRecords = records.filter((record) => shouldUseBackendForRecord(record, options));
+  let handledByBackend = new Set();
+  if (backendRecords.length && await ensureBackendAvailability()) {
+    handledByBackend = await extractRecordsWithBackend(backendRecords, options, runId);
+  }
+
+  const localRecords = records.filter((record) => !handledByBackend.has(record.id));
+  await Promise.all(localRecords.map(async (record) => {
     await populateRecordFromContent(record, options);
     if (runId === state.extractionRunId) {
       renderDataViews();

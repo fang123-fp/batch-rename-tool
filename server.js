@@ -12,6 +12,7 @@ const port = Number(process.env.PORT || 8123);
 const rootDir = __dirname;
 const baseDir = path.resolve(rootDir);
 const tempRootDir = path.join(baseDir, '.tmp');
+const APP_VERSION = '20260611-scanfix2';
 const maxUploadFiles = Number(process.env.MAX_UPLOAD_FILES || 200);
 const maxUploadFileSize = Number(process.env.MAX_UPLOAD_FILE_SIZE || 50 * 1024 * 1024);
 
@@ -279,7 +280,7 @@ app.get('/api/health', async (_request, response) => {
       message: `本地后端已就绪，当前使用 ${browserInfo.browserName}`,
       browserName: browserInfo.browserName,
       executablePath: browserInfo.executablePath,
-      appVersion: '20260610-localbackend1',
+      appVersion: APP_VERSION,
     });
   } catch (error) {
     response.status(503).json({
@@ -345,6 +346,7 @@ app.post('/api/extract', prepareUploadTempDir, upload.array('files', maxUploadFi
 
     response.json({
       ok: true,
+      appVersion: APP_VERSION,
       message: `本地后端已完成 ${extractedFiles.length} 份文件的统一识别`,
       files: extractedFiles,
     });

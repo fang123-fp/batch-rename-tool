@@ -12,6 +12,7 @@ const state = {
   focusPendingFieldId: "",
   backendStatus: "unknown",
   backendMessage: "",
+  backendAppVersion: "",
 };
 
 const TEXT_EXTENSIONS = new Set([".txt", ".csv", ".tsv", ".json", ".md", ".markdown", ".html", ".htm", ".xml"]);
@@ -29,7 +30,7 @@ const KNOWN_PDF_FIELD_REGION_HINTS = {
     whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-",
     allowAlternateCanvas: false,
   },
-  [normalizeFieldLabel("客户名称")]: { left: 0.18, top: 0.18, width: 0.70, height: 0.07, psm: "6" },
+  [normalizeFieldLabel("客户名称")]: { left: 0.18, top: 0.20, width: 0.70, height: 0.06, psm: "6" },
   [normalizeFieldLabel("仪器名称")]: { left: 0.18, top: 0.29, width: 0.70, height: 0.06, psm: "6", useThresholded: false, scale: 2, allowAlternateCanvas: false },
 };
 const FIELD_LABEL_ALIASES = {
@@ -168,7 +169,8 @@ let tesseractLoadPromise;
 let ocrQueueTail = Promise.resolve();
 let activeOcrJobCount = 0;
 let waitingOcrJobCount = 0;
-const STATIC_ASSET_VERSION = "20260610-localbackend1";
+const APP_VERSION = "20260611-scanfix2";
+const STATIC_ASSET_VERSION = APP_VERSION;
 const BACKEND_DISABLED_BY_QUERY = new URLSearchParams(window.location.search).get("backend") === "off";
 const BACKEND_EXTRACTABLE_EXTENSIONS = new Set([".pdf"]);
 let backendHealthPromise;
@@ -649,6 +651,10 @@ function getDocumentProfileLabel(profileId) {
   return "";
 }
 
+function hasBackendVersionMismatch() {
+  return Boolean(state.backendAppVersion && state.backendAppVersion !== APP_VERSION);
+}
+
 function getRecordProfileLabel(record) {
   return getDocumentProfileLabel(record?.documentProfile || "");
 }
@@ -682,6 +688,9 @@ function enqueueOcrTask(task) {
 
 function buildExtractionMessage(record) {
   const profileLabel = getRecordProfileLabel(record);
+  const shouldWarnVersionMismatch = hasBackendVersionMismatch()
+    && record?.extensionLower === ".pdf"
+    && looksLikeCertificateFieldSelection(state.fields);
   if (record.contentState === "reading") {
     return record.contentMessage || "正在读取文件内容...";
   }
@@ -693,6 +702,9 @@ function buildExtractionMessage(record) {
   }
   if (record.contentState === "ready") {
     const filledCount = getFilledFieldCount(record);
+    if (shouldWarnVersionMismatch) {
+      return `本地后端版本过旧，当前结果仅供参考，请重启服务后重新读取（当前匹配 ${filledCount}/${state.fields.length}）`;
+    }
     if (!filledCount) {
       return profileLabel
         ? `${profileLabel}已启用，但还没有匹配到字段，请检查字段名或文件内容格式`
@@ -817,8 +829,17 @@ function updateStatus() {
   const unsupportedCount = state.files.filter((record) => record.contentState === "unsupported" || record.contentState === "error").length;
   const incompleteCount = state.files.filter((record) => state.fields.some((field) => !normalizeWhitespace(record.values[field] || ""))).length;
   const duplicateCount = buildPreviewRows().filter((row) => row.duplicated).length;
+  const shouldBlockForVersionMismatch = hasBackendVersionMismatch()
+    && looksLikeCertificateFieldSelection(state.fields)
+    && state.files.some((record) => record.extensionLower === ".pdf");
 
   exportZipBtn.disabled = false;
+
+  if (shouldBlockForVersionMismatch) {
+    exportZipBtn.disabled = true;
+    setStatus(`检测到前后端版本不一致：前端 ${APP_VERSION}，后端 ${state.backendAppVersion}。请先重启本地服务，再重新读取证书 PDF`, "warn");
+    return;
+  }
 
   if (unsupportedCount) {
     setStatus(`有 ${unsupportedCount} 个文件暂不支持自动读取内容，你可以手动补字段后再下载`, "warn");
@@ -1038,7 +1059,8 @@ function buildDiagnosticsSnapshot() {
   const previewRows = buildPreviewRows();
   return {
     generatedAt: new Date().toISOString(),
-    appVersion: STATIC_ASSET_VERSION,
+    appVersion: APP_VERSION,
+    backendAppVersion: state.backendAppVersion,
     locationHref: window.location.href,
     userAgent: navigator.userAgent,
     language: navigator.language,
@@ -1092,6 +1114,22 @@ function triggerDownload(blob, fileName) {
   link.click();
   link.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function refreshVersionBadge() {
+  if (!appVersionBadge) {
+    return;
+  }
+
+  if (state.backendAppVersion) {
+    const mismatch = state.backendAppVersion !== APP_VERSION;
+    appVersionBadge.textContent = mismatch
+      ? `前端 ${APP_VERSION} / 后端 ${state.backendAppVersion}（版本不一致）`
+      : `前端 ${APP_VERSION} / 后端 ${state.backendAppVersion}`;
+    return;
+  }
+
+  appVersionBadge.textContent = `当前版本 ${APP_VERSION}`;
 }
 
 function escapeHtml(value) {
@@ -3163,6 +3201,8 @@ async function ensureBackendAvailability(force = false) {
     state.backendMessage = BACKEND_DISABLED_BY_QUERY
       ? "当前页面已显式关闭本地后端"
       : "当前页面不是 HTTP 服务，无法连接本地后端";
+    state.backendAppVersion = "";
+    refreshVersionBadge();
     return false;
   }
 
@@ -3177,14 +3217,25 @@ async function ensureBackendAvailability(force = false) {
         throw new Error(payload?.message || `本地后端不可用（${response.status}）`);
       }
 
+      state.backendAppVersion = String(payload.appVersion || "");
+      if (state.backendAppVersion && state.backendAppVersion !== APP_VERSION) {
+        state.backendStatus = "offline";
+        state.backendMessage = `前端版本 ${APP_VERSION}，本地后端版本 ${state.backendAppVersion}，请确认已在同一目录拉取最新代码并重启本地服务`;
+        refreshVersionBadge();
+        return false;
+      }
+
       state.backendStatus = "online";
       state.backendMessage = payload.message || "本地后端已连接";
+      refreshVersionBadge();
       return true;
     })
     .catch((error) => {
       console.warn("Backend health check failed:", error);
       state.backendStatus = "offline";
       state.backendMessage = formatErrorMessage(error);
+      state.backendAppVersion = "";
+      refreshVersionBadge();
       backendHealthPromise = null;
       return false;
     });
@@ -3219,6 +3270,9 @@ async function extractRecordsWithBackend(records, options = {}, runId = state.ex
     if (!response.ok || !payload?.ok) {
       throw new Error(payload?.message || `本地后端读取失败（${response.status}）`);
     }
+
+    state.backendAppVersion = String(payload.appVersion || state.backendAppVersion || "");
+    refreshVersionBadge();
 
     const returnedFiles = Array.isArray(payload.files) ? payload.files : [];
     const payloadByRecordId = new Map();
@@ -3441,8 +3495,6 @@ if (exportDiagnosticsBtn) {
 }
 exportZipBtn.addEventListener("click", exportZip);
 
-if (appVersionBadge) {
-  appVersionBadge.textContent = `当前版本 ${STATIC_ASSET_VERSION}`;
-}
+refreshVersionBadge();
 
 render();

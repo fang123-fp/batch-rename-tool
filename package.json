@@ -9,6 +9,8 @@
   "scripts": {
     "test": "node scripts/run-batch-regression.js",
     "test:regression": "node scripts/run-batch-regression.js",
+    "test:phase01-gate": "node scripts/run-phase01-performance-gate.js",
+    "test:root-cause-gate": "node scripts/run-root-cause-gate.js",
     "start": "node server.js"
   },
   "repository": {

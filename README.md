@@ -116,6 +116,7 @@ npm start
 
 - [docs/local-backend-service.md](docs/local-backend-service.md)
 - [docs/china-deployment.md](docs/china-deployment.md)
+- [docs/v2-optimization-plan.md](docs/v2-optimization-plan.md)
 
 ## 常见问题
 

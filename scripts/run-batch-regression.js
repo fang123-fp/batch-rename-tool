@@ -40,6 +40,42 @@ function formatDateToken(yyyymmdd) {
   return `${yyyymmdd.slice(0, 4)} 年 ${yyyymmdd.slice(4, 6)} 月 ${yyyymmdd.slice(6, 8)} 日`;
 }
 
+function parseListOption(value) {
+  return String(value || '')
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function chunkArray(items, size) {
+  const nextSize = Math.max(1, size || 1);
+  const chunks = [];
+  for (let index = 0; index < items.length; index += nextSize) {
+    chunks.push(items.slice(index, index + nextSize));
+  }
+  return chunks;
+}
+
+function computeMedian(numbers) {
+  const normalized = numbers.filter((value) => Number.isFinite(value)).sort((left, right) => left - right);
+  if (!normalized.length) {
+    return 0;
+  }
+  const middle = Math.floor(normalized.length / 2);
+  if (normalized.length % 2 === 1) {
+    return normalized[middle];
+  }
+  return Math.round((normalized[middle - 1] + normalized[middle]) / 2);
+}
+
+function computeAverage(numbers) {
+  const normalized = numbers.filter((value) => Number.isFinite(value));
+  if (!normalized.length) {
+    return 0;
+  }
+  return Math.round(normalized.reduce((sum, value) => sum + value, 0) / normalized.length);
+}
+
 async function ensureDirectory(dirPath) {
   await fsp.mkdir(dirPath, { recursive: true });
 }
@@ -114,12 +150,14 @@ async function stopServer(child) {
   });
 }
 
-async function extractFile(baseUrl, fields, filePath, sampleKey) {
+async function extractFiles(baseUrl, fields, filePaths, sampleKeys) {
   const form = new FormData();
   form.append('fields', JSON.stringify(fields));
-  form.append('recordIds', JSON.stringify([sampleKey]));
+  form.append('recordIds', JSON.stringify(sampleKeys));
   form.append('options', JSON.stringify({ strictCertificateMode: true }));
-  form.append('files', new Blob([fs.readFileSync(filePath)], { type: 'application/pdf' }), path.basename(filePath));
+  filePaths.forEach((filePath) => {
+    form.append('files', new Blob([fs.readFileSync(filePath)], { type: 'application/pdf' }), path.basename(filePath));
+  });
 
   const startedAt = Date.now();
   const response = await fetch(new URL('/api/extract', baseUrl), {
@@ -135,14 +173,10 @@ async function extractFile(baseUrl, fields, filePath, sampleKey) {
     throw new Error(message);
   }
 
-  const item = Array.isArray(payload.files) ? payload.files[0] : null;
-  if (!item) {
-    throw new Error('后端未返回文件结果');
-  }
-
   return {
     elapsedMs,
-    payload: item,
+    requestTimings: payload.timings || {},
+    payloadFiles: Array.isArray(payload.files) ? payload.files : [],
   };
 }
 
@@ -208,8 +242,17 @@ function renderMarkdown(report) {
   lines.push(`- Generated at: ${report.generatedAt}`);
   lines.push(`- Base URL: ${report.baseUrl}`);
   lines.push(`- Sample directory: ${report.sampleDir}`);
+  if (report.scenarioLabel) {
+    lines.push(`- Scenario: ${report.scenarioLabel}`);
+  }
+  lines.push(`- Request mode: ${report.requestMode}`);
+  lines.push(`- Request batch size: ${report.requestBatchSize}`);
   lines.push(`- Total samples: ${report.summary.totalSamples}`);
   lines.push(`- Total elapsed: ${report.summary.totalElapsedMs} ms`);
+  lines.push(`- Total request elapsed: ${report.summary.totalRequestElapsedMs} ms`);
+  lines.push(`- Request count: ${report.summary.requestCount}`);
+  lines.push(`- Median request elapsed: ${report.summary.medianRequestElapsedMs} ms`);
+  lines.push(`- Average request elapsed: ${report.summary.averageRequestElapsedMs} ms`);
   lines.push(`- Pass: ${report.summary.passCount}`);
   lines.push(`- Partial: ${report.summary.partialCount}`);
   lines.push(`- Fail: ${report.summary.failCount}`);
@@ -229,6 +272,12 @@ function renderMarkdown(report) {
     lines.push('');
     lines.push(`- Status: ${result.status}`);
     lines.push(`- Time: ${result.elapsedMs} ms`);
+    if (result.requestTimings && Object.keys(result.requestTimings).length) {
+      lines.push(`- Request timings: \`${JSON.stringify(result.requestTimings)}\``);
+    }
+    if (result.extractionTimings && Object.keys(result.extractionTimings).length) {
+      lines.push(`- Extraction timings: \`${JSON.stringify(result.extractionTimings)}\``);
+    }
     if (result.requestError) {
       lines.push(`- Error: ${result.requestError}`);
       lines.push('');
@@ -249,19 +298,30 @@ async function main() {
   const sampleDir = path.resolve(String(args['sample-dir'] || baseline.meta.defaultSampleDir));
   const baseUrl = String(args['base-url'] || process.env.REGRESSION_BASE_URL || 'http://127.0.0.1:8123');
   const outputDir = path.resolve(String(args['output-dir'] || path.join(repoRoot, '.tmp', 'regression')));
+  const scenarioLabel = String(args.label || args.scenario || '').trim();
+  const requestMode = String(args['request-mode'] || (args.batch ? 'batch' : 'single')).trim() === 'batch' ? 'batch' : 'single';
+  const requestedFiles = parseListOption(args['sample-files']);
   const fields = String(args.fields || '').trim()
     ? String(args.fields).split(',').map((part) => part.trim()).filter(Boolean)
     : baseline.meta.fields;
 
   await ensureDirectory(outputDir);
 
-  const pdfFiles = (await fsp.readdir(sampleDir))
+  const availablePdfFiles = (await fsp.readdir(sampleDir))
     .filter((entry) => entry.toLowerCase().endsWith('.pdf'))
     .sort((left, right) => left.localeCompare(right, 'zh-Hans-CN'));
+  const pdfFiles = requestedFiles.length
+    ? requestedFiles.filter((fileName) => availablePdfFiles.includes(fileName))
+    : availablePdfFiles;
+  const requestBatchSize = requestMode === 'batch'
+    ? Math.max(1, Number(args['batch-size'] || pdfFiles.length || 1))
+    : 1;
 
   const knownSamples = baseline.samples || {};
   const unexpectedFiles = pdfFiles.filter((fileName) => !Object.prototype.hasOwnProperty.call(knownSamples, fileName));
-  const missingFiles = Object.keys(knownSamples).filter((fileName) => !pdfFiles.includes(fileName));
+  const missingFiles = requestedFiles.length
+    ? requestedFiles.filter((fileName) => !availablePdfFiles.includes(fileName))
+    : Object.keys(knownSamples).filter((fileName) => !pdfFiles.includes(fileName));
 
   let serverHandle = null;
   let health = await healthCheck(baseUrl);
@@ -272,46 +332,93 @@ async function main() {
 
   const runStartedAt = Date.now();
   const results = [];
+  const requestElapsedTimes = [];
+  const requestGroups = requestMode === 'batch'
+    ? chunkArray(pdfFiles, requestBatchSize)
+    : pdfFiles.map((fileName) => [fileName]);
 
-  for (const fileName of pdfFiles) {
-    const filePath = path.join(sampleDir, fileName);
-    const sampleConfig = knownSamples[fileName] || { expected: {}, source: 'unexpected-file' };
-
+  for (const requestGroup of requestGroups) {
+    const filePaths = requestGroup.map((fileName) => path.join(sampleDir, fileName));
     try {
-      const { elapsedMs, payload } = await extractFile(baseUrl, fields, filePath, fileName);
-      const actualValues = payload.values || {};
-      const { comparisons, failedFields, openQuestionFields } = buildFieldComparisons(fields, sampleConfig.expected || {}, actualValues);
-      results.push({
-        fileName,
-        filePath,
-        status: classifyResult(failedFields, openQuestionFields, ''),
-        elapsedMs,
-        failedFields,
-        openQuestionFields,
-        comparisons,
-        values: actualValues,
-        contentMessage: payload.contentMessage || '',
-        contentState: payload.contentState || '',
-        documentProfile: payload.documentProfile || '',
-        expectedSource: sampleConfig.source || '',
-        notes: sampleConfig.notes || [],
+      const { elapsedMs, requestTimings, payloadFiles } = await extractFiles(baseUrl, fields, filePaths, requestGroup);
+      requestElapsedTimes.push(elapsedMs);
+      const payloadByRecordId = new Map();
+      payloadFiles.forEach((item, index) => {
+        const recordId = item && item.recordId ? item.recordId : requestGroup[index];
+        if (recordId) {
+          payloadByRecordId.set(recordId, item);
+        }
+      });
+
+      requestGroup.forEach((fileName, index) => {
+        const filePath = filePaths[index];
+        const sampleConfig = knownSamples[fileName] || { expected: {}, source: 'unexpected-file' };
+        const payload = payloadByRecordId.get(fileName) || payloadFiles[index] || null;
+        if (!payload) {
+          results.push({
+            fileName,
+            filePath,
+            status: 'FAIL',
+            elapsedMs,
+            failedFields: [],
+            openQuestionFields: fields.slice(),
+            comparisons: [],
+            values: {},
+            contentMessage: '',
+            contentState: 'error',
+            documentProfile: '',
+            requestTimings,
+            extractionTimings: {},
+            expectedSource: sampleConfig.source || '',
+            notes: sampleConfig.notes || [],
+            requestError: '后端未返回该文件的识别结果',
+          });
+          return;
+        }
+
+        const actualValues = payload.values || {};
+        const { comparisons, failedFields, openQuestionFields } = buildFieldComparisons(fields, sampleConfig.expected || {}, actualValues);
+        results.push({
+          fileName,
+          filePath,
+          status: classifyResult(failedFields, openQuestionFields, ''),
+          elapsedMs,
+          failedFields,
+          openQuestionFields,
+          comparisons,
+          values: actualValues,
+          contentMessage: payload.contentMessage || '',
+          contentState: payload.contentState || '',
+          documentProfile: payload.documentProfile || '',
+          requestTimings,
+          extractionTimings: payload.timings || {},
+          expectedSource: sampleConfig.source || '',
+          notes: sampleConfig.notes || [],
+          requestMode,
+          requestGroupSize: requestGroup.length,
+        });
       });
     } catch (error) {
-      results.push({
-        fileName,
-        filePath,
-        status: 'FAIL',
-        elapsedMs: 0,
-        failedFields: [],
-        openQuestionFields: fields.slice(),
-        comparisons: [],
-        values: {},
-        contentMessage: '',
-        contentState: 'error',
-        documentProfile: '',
-        expectedSource: sampleConfig.source || '',
-        notes: sampleConfig.notes || [],
-        requestError: error && error.message ? error.message : String(error),
+      requestGroup.forEach((fileName, index) => {
+        const sampleConfig = knownSamples[fileName] || { expected: {}, source: 'unexpected-file' };
+        results.push({
+          fileName,
+          filePath: filePaths[index],
+          status: 'FAIL',
+          elapsedMs: 0,
+          failedFields: [],
+          openQuestionFields: fields.slice(),
+          comparisons: [],
+          values: {},
+          contentMessage: '',
+          contentState: 'error',
+          documentProfile: '',
+          expectedSource: sampleConfig.source || '',
+          notes: sampleConfig.notes || [],
+          requestError: error && error.message ? error.message : String(error),
+          requestMode,
+          requestGroupSize: requestGroup.length,
+        });
       });
     }
   }
@@ -320,6 +427,10 @@ async function main() {
   const summary = {
     totalSamples: results.length,
     totalElapsedMs,
+    totalRequestElapsedMs: requestElapsedTimes.reduce((sum, value) => sum + value, 0),
+    requestCount: requestElapsedTimes.length,
+    medianRequestElapsedMs: computeMedian(requestElapsedTimes),
+    averageRequestElapsedMs: computeAverage(requestElapsedTimes),
     passCount: results.filter((item) => item.status === 'PASS').length,
     partialCount: results.filter((item) => item.status === 'PARTIAL').length,
     failCount: results.filter((item) => item.status === 'FAIL').length,
@@ -331,6 +442,9 @@ async function main() {
     generatedAt: new Date().toISOString(),
     baseUrl,
     sampleDir,
+    scenarioLabel,
+    requestMode,
+    requestBatchSize,
     fields,
     server: {
       reusedExistingServer: !serverHandle,
@@ -358,6 +472,12 @@ async function main() {
 
   results.forEach((result) => {
     console.log(`[${result.status}] ${result.fileName} ${result.elapsedMs}ms`);
+    if (result.requestTimings && Object.keys(result.requestTimings).length) {
+      console.log(`  requestTimings: ${JSON.stringify(result.requestTimings)}`);
+    }
+    if (result.extractionTimings && Object.keys(result.extractionTimings).length) {
+      console.log(`  extractionTimings: ${JSON.stringify(result.extractionTimings)}`);
+    }
     if (result.requestError) {
       console.log(`  error: ${result.requestError}`);
       return;
@@ -374,7 +494,7 @@ async function main() {
     }
   });
 
-  console.log(`Summary: total=${summary.totalSamples} pass=${summary.passCount} partial=${summary.partialCount} fail=${summary.failCount} totalElapsedMs=${summary.totalElapsedMs}`);
+  console.log(`Summary: total=${summary.totalSamples} pass=${summary.passCount} partial=${summary.partialCount} fail=${summary.failCount} totalElapsedMs=${summary.totalElapsedMs} totalRequestElapsedMs=${summary.totalRequestElapsedMs} requestCount=${summary.requestCount}`);
   if (summary.unexpectedFiles.length) {
     console.log(`Unexpected files: ${summary.unexpectedFiles.join(', ')}`);
   }

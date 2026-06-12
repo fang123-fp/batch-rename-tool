@@ -68,6 +68,8 @@ const DATE_LABEL_GROUPS = [
 ];
 const CERTIFICATE_TEMPLATE_PROFILE_ID = "calibration-certificate-v1";
 const CERTIFICATE_TEMPLATE_PROFILE_LABEL = "证书第一页锁定模式";
+const GIMT_CERTIFICATE_PROFILE_ID = "gimt-calibration-certificate-v1";
+const GIMT_CERTIFICATE_PROFILE_LABEL = "GIMT 绿色证书模式";
 const CERTIFICATE_TEMPLATE_MARKERS = [
   "校准证书",
   "Calibration Certificate",
@@ -81,6 +83,13 @@ const CERTIFICATE_TEMPLATE_MARKERS = [
   "Add.of Client",
   "Management No",
   "管理编号",
+];
+const GIMT_CERTIFICATE_MARKERS = [
+  "gimt",
+  "guangzhou institute of measurement",
+  "calibration certificate",
+  "institute",
+  "measurement",
 ];
 const CERTIFICATE_TEMPLATE_FIELDS = new Set([
   normalizeFieldLabel("证书编号"),
@@ -177,16 +186,23 @@ const exportDiagnosticsBtn = document.getElementById("exportDiagnosticsBtn");
 const appVersionBadge = document.getElementById("appVersionBadge");
 
 let pdfJsLibPromise;
-let ocrWorkerPromise;
+const ocrWorkerPromises = new Map();
 let tesseractLoadPromise;
-let ocrQueueTail = Promise.resolve();
+const pendingOcrTasks = [];
 let activeOcrJobCount = 0;
 let waitingOcrJobCount = 0;
-const APP_VERSION = "20260611-scanfix3";
+const activeOcrWorkerSlots = new Set();
+const OCR_CONCURRENCY_LIMIT = Math.max(1, Math.min(3, Number(new URLSearchParams(window.location.search).get("ocrConcurrency") || "2") || 2));
+const APP_VERSION = "20260612-phase01opt1";
 const STATIC_ASSET_VERSION = APP_VERSION;
 const BACKEND_DISABLED_BY_QUERY = new URLSearchParams(window.location.search).get("backend") === "off";
 const BACKEND_EXTRACTABLE_EXTENSIONS = new Set([".pdf"]);
 let backendHealthPromise;
+const fileFingerprintPromiseCache = new WeakMap();
+const fileArrayBufferPromiseCache = new WeakMap();
+const extractionArtifactCache = new Map();
+let serverWorkerOriginalNamesQueue = [];
+let activeWorkerRequestOptions = {};
 
 function resolveAssetUrl(relativePath, options = {}) {
   const { versioned = true } = options;
@@ -195,6 +211,114 @@ function resolveAssetUrl(relativePath, options = {}) {
     url.searchParams.set("v", STATIC_ASSET_VERSION);
   }
   return url.href;
+}
+
+function getNowMs() {
+  if (typeof performance !== "undefined" && typeof performance.now === "function") {
+    return performance.now();
+  }
+  return Date.now();
+}
+
+function getElapsedMs(startedAt) {
+  return Math.max(0, Math.round(getNowMs() - startedAt));
+}
+
+function isWorkerDiagnosticOptionEnabled(optionName) {
+  return Boolean(activeWorkerRequestOptions && activeWorkerRequestOptions[optionName]);
+}
+
+function shouldDisableFilenameFallbackForDiagnostics() {
+  return isWorkerDiagnosticOptionEnabled("diagnosticDisableFilenameFallback");
+}
+
+function shouldDisableKnownAddressFallbackForDiagnostics() {
+  return isWorkerDiagnosticOptionEnabled("diagnosticDisableKnownAddressFallback");
+}
+
+function shouldForcePdfOcrForDiagnostics() {
+  return isWorkerDiagnosticOptionEnabled("diagnosticForceOcrForAllFields");
+}
+
+function normalizeFieldSetKey(fields = []) {
+  return [...new Set((fields || []).map((field) => normalizeFieldLabel(field)).filter(Boolean))]
+    .sort()
+    .join(",");
+}
+
+function getTemplateFamilyHint(fields = state.fields, documentProfile = "") {
+  if (documentProfile) {
+    return documentProfile;
+  }
+  return looksLikeCertificateFieldSelection(fields) ? CERTIFICATE_TEMPLATE_PROFILE_ID : "generic";
+}
+
+function buildExtractionCacheKey({ kind, fileHash, page = "all", templateFamily = "generic", fieldSet = "-" }) {
+  return [kind, fileHash || "unknown", `page:${page}`, `template:${templateFamily}`, `fields:${fieldSet || "-"}`].join("|");
+}
+
+function cloneStructuredValue(value) {
+  if (value === null || value === undefined) {
+    return value;
+  }
+  return JSON.parse(JSON.stringify(value));
+}
+
+function getCachedExtractionArtifact(cacheKey) {
+  const value = extractionArtifactCache.get(cacheKey);
+  return value ? cloneStructuredValue(value) : null;
+}
+
+function setCachedExtractionArtifact(cacheKey, value) {
+  extractionArtifactCache.set(cacheKey, cloneStructuredValue(value));
+}
+
+async function getFileArrayBuffer(file) {
+  if (!fileArrayBufferPromiseCache.has(file)) {
+    fileArrayBufferPromiseCache.set(file, file.arrayBuffer().then((buffer) => new Uint8Array(buffer)));
+  }
+  const bytes = await fileArrayBufferPromiseCache.get(file);
+  return bytes.slice().buffer;
+}
+
+async function getFileFingerprint(file) {
+  if (!fileFingerprintPromiseCache.has(file)) {
+    fileFingerprintPromiseCache.set(file, (async () => {
+      const buffer = await getFileArrayBuffer(file);
+      const digest = await crypto.subtle.digest("SHA-1", buffer);
+      return Array.from(new Uint8Array(digest), (part) => part.toString(16).padStart(2, "0")).join("");
+    })());
+  }
+  return fileFingerprintPromiseCache.get(file);
+}
+
+function mergeRecordTimings(record, nextTimings = {}) {
+  const merged = { ...(record.extractionTimings || {}) };
+  Object.entries(nextTimings || {}).forEach(([key, value]) => {
+    if (value === undefined) {
+      return;
+    }
+    if (typeof value === "number" && Number.isFinite(value)) {
+      const previous = typeof merged[key] === "number" && Number.isFinite(merged[key]) ? merged[key] : 0;
+      merged[key] = previous + value;
+      return;
+    }
+    merged[key] = value;
+  });
+  record.extractionTimings = merged;
+}
+
+function hasAttemptedOcrFieldSet(record, fieldSetKey) {
+  return Boolean(fieldSetKey) && Array.isArray(record?.ocrAttemptedFieldSetKeys) && record.ocrAttemptedFieldSetKeys.includes(fieldSetKey);
+}
+
+function markAttemptedOcrFieldSet(record, fieldSetKey) {
+  if (!fieldSetKey) {
+    return;
+  }
+  const attempted = new Set(Array.isArray(record.ocrAttemptedFieldSetKeys) ? record.ocrAttemptedFieldSetKeys : []);
+  attempted.add(fieldSetKey);
+  record.ocrAttemptedFieldSetKeys = [...attempted];
 }
 
 function formatErrorMessage(error) {
@@ -393,7 +517,7 @@ async function commitPendingField(pendingFieldId, rawValue) {
   state.fields.push(ensureUniqueFieldName(nextName));
   applyFieldsToRecords();
   render();
-  await refreshAutoExtraction(state.files, { reReadContent: true });
+  await refreshAutoExtraction(state.files, { reReadContent: false });
   return true;
 }
 
@@ -515,7 +639,7 @@ function shouldUseFilenameFallbackForField(field, extractedValue, filenameFallba
     return !extractBestDateValue(extracted);
   }
   if (fieldKey === normalizeFieldLabel("客户名称")) {
-    return /[&"“”]|[ÃÂåäçéèöüæ]/.test(extracted) || extracted.length < 4;
+    return /[&"“”�]|[ÃÂåäçéèöüæ]/.test(extracted) || extracted.length < 4;
   }
   if (fieldKey === normalizeFieldLabel("仪器名称")) {
     return !hasCjkCharacters(extracted) || /[ÃÂåäçéèöüæ]/.test(extracted);
@@ -589,6 +713,57 @@ function getKnownCustomerAddress(customerName) {
   return KNOWN_CUSTOMER_ADDRESS_FALLBACKS[normalizedName] || "";
 }
 
+function repairFilenameFallbackArtifacts(record, filenameFieldValues = {}) {
+  if (shouldDisableFilenameFallbackForDiagnostics()) {
+    return;
+  }
+
+  const customerField = "客户名称";
+  const addressField = "地址";
+  const filenameCustomer = getFilenameFallbackFieldValue(customerField, filenameFieldValues);
+  const currentCustomer = normalizeWhitespace(record.values?.[customerField] || record.autoValues?.[customerField] || "");
+  const trustStructuredFilenameMetadata = hasStructuredFilenameFieldAgreement(record, filenameFieldValues);
+
+  if (filenameCustomer && (trustStructuredFilenameMetadata || /�/.test(currentCustomer))) {
+    const repairedCustomer = trustStructuredFilenameMetadata
+      ? filenameCustomer
+      : (mergeCorruptedChineseText(filenameCustomer, currentCustomer) || filenameCustomer);
+    const previousAutoCustomer = record.autoValues?.[customerField] || "";
+    const currentValueCustomer = record.values?.[customerField] || "";
+    record.autoValues[customerField] = repairedCustomer;
+    if (
+      !normalizeWhitespace(currentValueCustomer)
+      || currentValueCustomer === previousAutoCustomer
+      || /�/.test(currentValueCustomer)
+      || compactChineseValue(currentValueCustomer) !== compactChineseValue(repairedCustomer)
+    ) {
+      record.values[customerField] = repairedCustomer;
+    }
+  }
+
+  const resolvedCustomer = record.values?.[customerField]
+    || record.autoValues?.[customerField]
+    || filenameCustomer
+    || "";
+  if (shouldDisableKnownAddressFallbackForDiagnostics()) {
+    return;
+  }
+
+  const knownAddress = getKnownCustomerAddress(resolvedCustomer);
+  if (!knownAddress) {
+    return;
+  }
+
+  const previousAutoAddress = record.autoValues?.[addressField] || "";
+  const currentAddress = record.values?.[addressField] || "";
+  if (!normalizeWhitespace(previousAutoAddress)) {
+    record.autoValues[addressField] = knownAddress;
+  }
+  if (!normalizeWhitespace(currentAddress) || currentAddress === previousAutoAddress) {
+    record.values[addressField] = knownAddress;
+  }
+}
+
 function shouldTrustStructuredFilename(record, filenameFieldValues) {
   if (!record || !filenameFieldValues["证书编号"] || !filenameFieldValues["管理编号"]) {
     return false;
@@ -617,6 +792,36 @@ function shouldTrustStructuredFilename(record, filenameFieldValues) {
   });
 
   return comparableCount >= 3 && mismatchCount >= 2;
+}
+
+function hasStructuredFilenameFieldAgreement(record, filenameFieldValues) {
+  if (!record || !filenameFieldValues["证书编号"] || !filenameFieldValues["管理编号"]) {
+    return false;
+  }
+
+  const anchorFields = ["证书编号", "管理编号", "仪器名称", "校准日期"];
+  let comparableCount = 0;
+  let matchCount = 0;
+
+  anchorFields.forEach((field) => {
+    const filenameValue = normalizeWhitespace(filenameFieldValues[field] || "");
+    if (!filenameValue) {
+      return;
+    }
+
+    comparableCount += 1;
+    const extractedValue = normalizeWhitespace(
+      record.autoValues?.[field]
+        || extractFieldValueFromText(record.contentText || "", field)
+        || record.values?.[field]
+        || "",
+    );
+    if (extractedValue && extractedValue === filenameValue) {
+      matchCount += 1;
+    }
+  });
+
+  return comparableCount >= 3 && matchCount >= 3;
 }
 
 function buildPreviewRows() {
@@ -680,7 +885,7 @@ function renderFieldList() {
         return;
       }
       renderDataViews();
-      await refreshAutoExtraction(state.files, { reReadContent: true });
+      await refreshAutoExtraction(state.files, { reReadContent: false });
     });
 
     const insertBtn = document.createElement("button");
@@ -703,7 +908,7 @@ function renderFieldList() {
       });
       applyFieldsToRecords();
       render();
-      await refreshAutoExtraction(state.files, { reReadContent: true });
+      await refreshAutoExtraction(state.files, { reReadContent: false });
     });
 
     const actionRow = document.createElement("div");
@@ -870,10 +1075,17 @@ function looksLikeCertificateFieldSelection(fields = state.fields) {
 }
 
 function getDocumentProfileLabel(profileId) {
+  if (profileId === GIMT_CERTIFICATE_PROFILE_ID) {
+    return GIMT_CERTIFICATE_PROFILE_LABEL;
+  }
   if (profileId === CERTIFICATE_TEMPLATE_PROFILE_ID) {
     return CERTIFICATE_TEMPLATE_PROFILE_LABEL;
   }
   return "";
+}
+
+function isCertificateTemplateProfile(profileId) {
+  return profileId === CERTIFICATE_TEMPLATE_PROFILE_ID || profileId === GIMT_CERTIFICATE_PROFILE_ID;
 }
 
 function hasBackendVersionMismatch() {
@@ -891,23 +1103,43 @@ function buildQueuedOcrMessage(queuePosition) {
   return "正在识别扫描版 PDF，可能需要 1 分钟左右...";
 }
 
-function enqueueOcrTask(task) {
-  const queuePosition = activeOcrJobCount + waitingOcrJobCount;
-  waitingOcrJobCount += 1;
+function takeNextAvailableOcrWorkerSlot() {
+  for (let slot = 0; slot < OCR_CONCURRENCY_LIMIT; slot += 1) {
+    if (!activeOcrWorkerSlots.has(slot)) {
+      activeOcrWorkerSlots.add(slot);
+      return slot;
+    }
+  }
+  return 0;
+}
 
-  const scheduled = ocrQueueTail
-    .catch(() => {})
-    .then(async () => {
-      waitingOcrJobCount = Math.max(0, waitingOcrJobCount - 1);
-      activeOcrJobCount += 1;
-      try {
-        return await task();
-      } finally {
+function drainOcrQueue() {
+  while (activeOcrJobCount < OCR_CONCURRENCY_LIMIT && pendingOcrTasks.length) {
+    const nextTask = pendingOcrTasks.shift();
+    if (!nextTask) {
+      break;
+    }
+    waitingOcrJobCount = Math.max(0, waitingOcrJobCount - 1);
+    activeOcrJobCount += 1;
+    const workerSlot = takeNextAvailableOcrWorkerSlot();
+    Promise.resolve()
+      .then(() => nextTask.task(workerSlot))
+      .then(nextTask.resolve, nextTask.reject)
+      .finally(() => {
         activeOcrJobCount = Math.max(0, activeOcrJobCount - 1);
-      }
-    });
+        activeOcrWorkerSlots.delete(workerSlot);
+        drainOcrQueue();
+      });
+  }
+}
 
-  ocrQueueTail = scheduled.catch(() => {});
+function enqueueOcrTask(task) {
+  const queuePosition = Math.max(0, activeOcrJobCount + waitingOcrJobCount - OCR_CONCURRENCY_LIMIT);
+  waitingOcrJobCount += 1;
+  const scheduled = new Promise((resolve, reject) => {
+    pendingOcrTasks.push({ task, resolve, reject });
+    drainOcrQueue();
+  });
   return { queuePosition, promise: scheduled };
 }
 
@@ -1090,7 +1322,10 @@ function render() {
 }
 
 function makeRecord(file) {
-  const parts = splitName(file.name);
+  const originalName = typeof serverWorkerOriginalNamesQueue[0] === "string"
+    ? serverWorkerOriginalNamesQueue.shift()
+    : file.name;
+  const parts = splitName(originalName);
   const values = {};
   const autoValues = {};
   state.fields.forEach((field) => {
@@ -1100,7 +1335,7 @@ function makeRecord(file) {
   return {
     id: createLocalId(),
     file,
-    originalName: file.name,
+    originalName,
     baseName: parts.base,
     extension: parts.extension,
     extensionLower: parts.extension.toLowerCase(),
@@ -1113,9 +1348,12 @@ function makeRecord(file) {
     contentMessage: "等待读取文件内容",
     contentTypeLabel: "",
     ocrAttempted: false,
+    ocrAttemptedFieldSetKeys: [],
     documentProfile: "",
     templateFieldValues: {},
     templateDiagnostics: null,
+    extractionTimings: {},
+    fileHash: "",
   };
 }
 
@@ -1127,9 +1365,12 @@ function resetRecordExtractionArtifacts(record) {
   record.contentState = "idle";
   record.contentMessage = "等待读取文件内容";
   record.ocrAttempted = false;
+  record.ocrAttemptedFieldSetKeys = [];
   record.documentProfile = "";
   record.templateFieldValues = {};
   record.templateDiagnostics = null;
+  record.extractionTimings = {};
+  record.fileHash = "";
 }
 
 function updateRecordContentText(record) {
@@ -1160,18 +1401,26 @@ function applyRecordExtractionMetadata(record, metadata = {}) {
   if (metadata.documentProfile) {
     record.documentProfile = metadata.documentProfile;
   }
+  if (metadata.fileHash) {
+    record.fileHash = metadata.fileHash;
+  }
   if (metadata.templateFieldValues) {
     mergeTemplateFieldValues(record, metadata.templateFieldValues);
   }
   if (metadata.templateDiagnostics) {
     mergeTemplateDiagnostics(record, metadata.templateDiagnostics);
   }
+  if (metadata.timings) {
+    mergeRecordTimings(record, metadata.timings);
+  }
 }
 
 function replaceRecordExtractionMetadata(record, metadata = {}) {
   record.documentProfile = metadata.documentProfile || "";
+  record.fileHash = metadata.fileHash || "";
   record.templateFieldValues = { ...(metadata.templateFieldValues || {}) };
   record.templateDiagnostics = metadata.templateDiagnostics || null;
+  record.extractionTimings = { ...(metadata.timings || {}) };
 }
 
 function buildStructuredFieldLinesFromText(text, fields = state.fields) {
@@ -1238,7 +1487,7 @@ async function exportZip() {
     renderDataViews();
   }
   if (state.files.length && fieldsChanged) {
-    await refreshAutoExtraction(state.files, { reReadContent: true });
+    await refreshAutoExtraction(state.files, { reReadContent: false });
   }
   const previewRows = buildPreviewRows();
   exportZipBtn.disabled = true;
@@ -1302,8 +1551,11 @@ function buildDiagnosticsSnapshot() {
       contentMessage: row.contentMessage,
       contentTypeLabel: row.contentTypeLabel,
       ocrAttempted: row.ocrAttempted,
+      ocrAttemptedFieldSetKeys: [...(row.ocrAttemptedFieldSetKeys || [])],
       documentProfile: row.documentProfile,
       documentProfileLabel: getDocumentProfileLabel(row.documentProfile),
+      fileHash: row.fileHash || "",
+      extractionTimings: { ...(row.extractionTimings || {}) },
       values: { ...row.values },
       autoValues: { ...row.autoValues },
       templateFieldValues: { ...(row.templateFieldValues || {}) },
@@ -1459,6 +1711,21 @@ function extractBestStructuredIdentifier(value) {
   return matches.sort((left, right) => right.length - left.length)[0] || "";
 }
 
+function extractBestStructuredReportNumber(value) {
+  const compact = normalizeWhitespace(value || "").replace(/\s+/g, "");
+  if (!compact) {
+    return "";
+  }
+
+  const preferredReMatch = compact.match(/RE\d{6,}/i);
+  if (preferredReMatch) {
+    return preferredReMatch[0];
+  }
+
+  const matches = compact.match(/[A-Z]{1,3}\d{6,}/gi) || [];
+  return matches.sort((left, right) => right.length - left.length)[0] || "";
+}
+
 function extractIdentifierLikeCandidates(value) {
   const compact = normalizeWhitespace(value || "").replace(/\s+/g, "");
   if (!compact) {
@@ -1604,8 +1871,10 @@ function looksLikeManagementIdentifier(value) {
   return /^LD[-_/]?EQ[0-9A-Z-]{2,}$/i.test(normalized);
 }
 
+const CERTIFICATE_IDENTIFIER_PREFIX_PATTERN = "[A-Z]\\d{4}(?:\\d|[A-Z]|[A-Z]\\d{2})";
+
 function matchesCertificateIdentifierPattern(identifier) {
-  return /^[A-Z]\d{4}(?:\d|[A-Z]\d{2})-(?:\d{7}|[A-Z]\d{6})$/i.test(identifier);
+  return new RegExp(`^${CERTIFICATE_IDENTIFIER_PREFIX_PATTERN}-(?:\\d{7}|[A-Z]\\d{6})$`, "i").test(identifier);
 }
 
 function scoreCertificateIdentifierVariant(candidate, sourceIdentifier = "") {
@@ -1641,16 +1910,21 @@ function normalizeCertificateIdentifierArtifacts(value) {
 
   [...variants].forEach((candidate) => {
     const trimmedTrailingLetters = candidate.replace(
-      /^([A-Z]\d{4}(?:\d|[A-Z]\d{2})-(?:\d{7}|[A-Z]\d{6}))[A-Z]{1,4}$/i,
+      new RegExp(`^(${CERTIFICATE_IDENTIFIER_PREFIX_PATTERN}-(?:\\d{7}|[A-Z]\\d{6}))[A-Z]{1,4}$`, "i"),
       "$1",
     );
     if (trimmedTrailingLetters !== candidate) {
       variants.add(trimmedTrailingLetters);
     }
 
-    const shortened = candidate.replace(/^([A-Z]\d{4}(?:\d|[A-Z]\d{2})-)([A-Z])\d(\d{6})$/i, "$1$2$3");
+    const shortened = candidate.replace(new RegExp(`^(${CERTIFICATE_IDENTIFIER_PREFIX_PATTERN}-)([A-Z])\\d(\\d{6})$`, "i"), "$1$2$3");
     if (shortened !== candidate) {
       variants.add(shortened);
+    }
+
+    const gimtSuffixRecovered = candidate.replace(new RegExp(`^(${CERTIFICATE_IDENTIFIER_PREFIX_PATTERN}-)6(\\d{6})$`, "i"), "$1G$2");
+    if (gimtSuffixRecovered !== candidate) {
+      variants.add(gimtSuffixRecovered);
     }
 
   });
@@ -1672,6 +1946,23 @@ function looksLikeCertificateIdentifier(value) {
   }
 
   return matchesCertificateIdentifierPattern(identifier);
+}
+
+function isAmbiguousCertificateIdentifierValue(value) {
+  const normalized = normalizeWhitespace(value || "");
+  if (!normalized) {
+    return true;
+  }
+
+  if (/^[A-Z]?\d{6,7}$/i.test(normalized)) {
+    return true;
+  }
+
+  if (/^Z2025(?:1|N12)-6\d{6}$/i.test(normalized)) {
+    return true;
+  }
+
+  return false;
 }
 
 function extractBestModelValue(value) {
@@ -1941,6 +2232,40 @@ function pickBestOcrValueCandidate(labelLine, lines, field) {
   return belowCandidates.length ? belowCandidates[0].line.text : "";
 }
 
+function collectDeferredBelowOcrCandidates(labelLine, lines, field) {
+  const labelHeight = Math.max(labelLine.height, 12);
+  const maxVerticalDistance = Math.max(labelHeight * 14, 240);
+  const candidates = [];
+
+  lines.forEach((line, index) => {
+    if (line === labelLine) {
+      return;
+    }
+    if (line.top < labelLine.bottom - 4) {
+      return;
+    }
+    if (line.top - labelLine.bottom > maxVerticalDistance) {
+      return;
+    }
+    if (isLikelyOcrLabel(line.text, field)) {
+      return;
+    }
+
+    const candidateValue = normalizeFieldValueForOutput(field, stripTrailingPaginationArtifacts(line.text));
+    if (!isUsableExtractedValue(candidateValue, field, { rawValue: line.text })) {
+      return;
+    }
+
+    candidates.push({
+      value: candidateValue,
+      rawValue: line.text,
+      sourceBonus: Math.max(4, 24 - index),
+    });
+  });
+
+  return candidates;
+}
+
 function buildStructuredTextFromOcrLines(lines, fields) {
   if (!lines.length || !fields.length) {
     return "";
@@ -2049,6 +2374,25 @@ function renderThresholdedCanvas(context, width, height, threshold = 180) {
   context.putImageData(imageData, 0, 0);
 }
 
+function preprocessGimtGreenCanvas(context, width, height) {
+  const imageData = context.getImageData(0, 0, width, height);
+  const { data } = imageData;
+
+  for (let index = 0; index < data.length; index += 4) {
+    const red = data[index];
+    const green = data[index + 1];
+    const blue = data[index + 2];
+    const brightness = (red + green + blue) / 3;
+    const greenBias = green - ((red + blue) / 2);
+    const next = brightness > 172 || greenBias > 10 ? 255 : 0;
+    data[index] = next;
+    data[index + 1] = next;
+    data[index + 2] = next;
+  }
+
+  context.putImageData(imageData, 0, 0);
+}
+
 async function renderPdfPageToCanvas(page, scale = 3, threshold = 180) {
   const viewport = page.getViewport({ scale });
   const canvas = document.createElement("canvas");
@@ -2139,6 +2483,14 @@ function getRegionSourceCanvases(field, thresholdedCanvas, rawCanvas) {
     return [];
   }
 
+  return getRegionSourceCanvasesForHint(regionHint, thresholdedCanvas, rawCanvas);
+}
+
+function getRegionSourceCanvasesForHint(regionHint, thresholdedCanvas, rawCanvas) {
+  if (!regionHint || !thresholdedCanvas) {
+    return [];
+  }
+
   const preferredCanvas = regionHint.useThresholded ? thresholdedCanvas : (rawCanvas || thresholdedCanvas);
   const alternateCanvas = regionHint.useThresholded ? (rawCanvas || null) : thresholdedCanvas;
   const canvases = [preferredCanvas];
@@ -2165,6 +2517,9 @@ async function extractOcrValueFromRegion(canvas, worker, regionHint) {
   const context = cropCanvas.getContext("2d");
   context.imageSmoothingEnabled = false;
   context.drawImage(canvas, left, top, width, height, 0, 0, cropCanvas.width, cropCanvas.height);
+  if (regionHint.preprocess === "gimt-green") {
+    preprocessGimtGreenCanvas(context, cropCanvas.width, cropCanvas.height);
+  }
 
   await worker.setParameters({
     tessedit_pageseg_mode: regionHint.psm || "6",
@@ -2235,6 +2590,54 @@ async function extractStrongRegionFieldValue(field, thresholdedCanvas, rawCanvas
   return selectedCandidate.value;
 }
 
+const GIMT_PROFILE_REGION_HINTS = {
+  [normalizeFieldLabel("证书编号")]: { left: 0.16, top: 0.182, width: 0.32, height: 0.055, psm: "6", useThresholded: false, scale: 5, whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-" },
+  [normalizeFieldLabel("客户名称")]: { left: 0.30, top: 0.235, width: 0.48, height: 0.05, psm: "7", useThresholded: false, scale: 4 },
+  [normalizeFieldLabel("地址")]: { left: 0.30, top: 0.285, width: 0.50, height: 0.07, psm: "6", useThresholded: false, scale: 4 },
+  [normalizeFieldLabel("仪器名称")]: { left: 0.18, top: 0.34, width: 0.48, height: 0.065, psm: "6", useThresholded: false, scale: 5 },
+  [normalizeFieldLabel("管理编号")]: { left: 0.20, top: 0.54, width: 0.44, height: 0.07, psm: "6", useThresholded: false, scale: 5, whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-" },
+  [normalizeFieldLabel("校准日期")]: { left: 0.44, top: 0.74, width: 0.30, height: 0.05, psm: "6", useThresholded: false, scale: 5, whitelist: "0123456789-.年月日 " },
+};
+
+function getGimtProfileRegionHint(field) {
+  return GIMT_PROFILE_REGION_HINTS[normalizeFieldLabel(field)] || null;
+}
+
+async function buildGimtProfileStructuredText(thresholdedCanvas, rawCanvas, worker, fields) {
+  if (!fields.length) {
+    return "";
+  }
+
+  const results = [];
+  for (const field of fields) {
+    const regionHint = getGimtProfileRegionHint(field);
+    if (!regionHint) {
+      continue;
+    }
+
+    const candidates = [];
+    const canvases = getRegionSourceCanvasesForHint(regionHint, thresholdedCanvas, rawCanvas);
+    for (let index = 0; index < canvases.length; index += 1) {
+      const regionValue = normalizeFieldValueForOutput(field, await extractOcrValueFromRegion(canvases[index], worker, regionHint));
+      if (!isUsableExtractedValue(regionValue, field, { rawValue: regionValue })) {
+        continue;
+      }
+      candidates.push({
+        value: regionValue,
+        rawValue: regionValue,
+        sourceBonus: index === 0 ? 34 : 18,
+      });
+    }
+
+    const selectedValue = selectBestFieldCandidate(field, candidates);
+    if (isUsableExtractedValue(selectedValue, field)) {
+      results.push(`${field}：${selectedValue}`);
+    }
+  }
+
+  return results.join("\n");
+}
+
 async function buildPreciseRegionStructuredText(thresholdedCanvas, rawCanvas, worker, fields, pageNumber) {
   if (pageNumber !== 1 || !fields.length) {
     return {
@@ -2299,6 +2702,8 @@ async function buildStructuredTextFromOcrPage(canvas, rawCanvas, worker, lines, 
           candidates.push({ value: rawCropValue, rawValue: labelLine.text, sourceBonus: 14 });
         }
       }
+
+      candidates.push(...collectDeferredBelowOcrCandidates(labelLine, lines, field));
     }
 
     if (regionHint) {
@@ -2318,21 +2723,22 @@ async function buildStructuredTextFromOcrPage(canvas, rawCanvas, worker, lines, 
   return results.join("\n");
 }
 
-async function getOcrWorker() {
+async function getOcrWorker(workerSlot = 0) {
   const tesseract = await ensureTesseractLoaded();
 
-  if (!ocrWorkerPromise) {
-    ocrWorkerPromise = tesseract.createWorker("chi_sim+eng", 1, {
+  if (!ocrWorkerPromises.has(workerSlot)) {
+    const workerPromise = tesseract.createWorker("chi_sim+eng", 1, {
       workerPath: resolveAssetUrl("./vendor/tesseract/worker.min.js"),
       corePath: resolveAssetUrl("./vendor/tesseract-core/", { versioned: false }),
       langPath: resolveAssetUrl("./vendor/tessdata/", { versioned: false }),
     }).catch((error) => {
-      ocrWorkerPromise = null;
+      ocrWorkerPromises.delete(workerSlot);
       throw error;
     });
+    ocrWorkerPromises.set(workerSlot, workerPromise);
   }
 
-  return ocrWorkerPromise;
+  return ocrWorkerPromises.get(workerSlot);
 }
 
 function isProbableFieldLabel(label, currentField = "") {
@@ -2441,8 +2847,19 @@ function normalizeFieldValueForOutput(field, value) {
 
   if (fieldKey === normalizeFieldLabel("证书编号")) {
     const identifier = normalizeCertificateIdentifierArtifacts(nextValue);
-    if (identifier) {
+    if (identifier && looksLikeCertificateIdentifier(identifier)) {
       return identifier;
+    }
+    const reportNumber = extractBestStructuredReportNumber(nextValue);
+    if (reportNumber) {
+      return reportNumber;
+    }
+  }
+
+  if (fieldKey === normalizeFieldLabel("管理编号")) {
+    const managementIdentifier = (normalizeWhitespace(nextValue || "").match(/LD[-_/]?EQ[0-9A-Z-]{2,}/i) || [])[0] || "";
+    if (managementIdentifier) {
+      return managementIdentifier;
     }
   }
 
@@ -2465,6 +2882,13 @@ function normalizeFieldValueForOutput(field, value) {
     if (dateValue) {
       return dateValue;
     }
+  }
+
+  if (fieldKey === normalizeFieldLabel("仪器名称")) {
+    nextValue = nextValue
+      .replace(/^[A-Za-z]\s*/i, "")
+      .replace(/^(?:名\s*称|检测对象|Test\s*item|Description)\s*/i, "")
+      .trim();
   }
 
   if (isModelFieldKey(fieldKey)) {
@@ -2647,11 +3071,13 @@ function scoreFieldCandidate(field, value, options = {}) {
     const customerHintHits = countKeywordHits(normalized, CUSTOMER_NAME_HINTS);
     const companyHintHits = countKeywordHits(normalized, COMPANY_NAME_HINTS);
     const addressHintHits = countKeywordHits(normalized, ADDRESS_HINTS);
+    const suspiciousSymbolCount = countPatternMatches(normalized, /[&"'“”‘’|`~]/g);
     score += cjkCount * 12;
     score -= latinCount * 8;
     score -= digitCount * 8;
     score += customerHintHits * 40;
     score += companyHintHits * 24;
+    score -= suspiciousSymbolCount * 40;
     if (addressHintHits >= 2 && customerHintHits + companyHintHits === 0) {
       return -Infinity;
     }
@@ -2667,6 +3093,9 @@ function scoreFieldCandidate(field, value, options = {}) {
     if (latinCount > cjkCount) {
       score -= 60;
     }
+    if (/^[^A-Za-z\u3400-\u9fff（(]+/.test(normalized)) {
+      score -= 80;
+    }
     return score >= 40 ? score : -Infinity;
   }
 
@@ -2676,12 +3105,16 @@ function scoreFieldCandidate(field, value, options = {}) {
     }
 
     const addressHits = countKeywordHits(normalized, ADDRESS_HINTS);
+    const modelHintHits = countKeywordHits(normalized, ["型号", "规格"]);
     score += cjkCount * 8;
     score += digitCount * 3;
     score += addressHits * 45;
     score -= latinCount * 6;
-    if (/仪器|Description|客户|公司|Client\s*Name|Model|Serial/i.test(normalized)) {
+    if (/仪器|Description|客户|公司|Client\s*Name|Model|Type|规格|型号|Serial/i.test(normalized)) {
       score -= 120;
+    }
+    if (modelHintHits > 0 && digitCount < 3) {
+      return -Infinity;
     }
     if (addressHits === 0 && !(digitCount >= 3 && cjkCount >= 8)) {
       return -Infinity;
@@ -2712,6 +3145,12 @@ function scoreFieldCandidate(field, value, options = {}) {
       score -= 260;
     }
     if (addressHintHits >= 3) {
+      return -Infinity;
+    }
+    if (
+      fieldKey === normalizeFieldLabel("仪器名称")
+      && (countKeywordHits(normalized, CUSTOMER_NAME_HINTS) > 0 || countKeywordHits(normalized, COMPANY_NAME_HINTS) > 0)
+    ) {
       return -Infinity;
     }
     if (/日期|Date|编号|No\.?|地址|Address|Model|Type|规格|管理|校准|证书/i.test(originalText) && !matchesFieldLabelText(originalText, field)) {
@@ -3040,6 +3479,12 @@ function detectCertificateDocumentProfile(options = {}) {
   }
 
   const markerSource = normalizeExtractedText([options.baseText, options.rawText].filter(Boolean).join("\n")).toLowerCase();
+  const hasGimtBrand = markerSource.includes("gimt")
+    || markerSource.includes("guangzhou institute of measurement")
+    || (markerSource.includes("institute") && markerSource.includes("measurement"));
+  if (hasGimtBrand) {
+    return GIMT_CERTIFICATE_PROFILE_ID;
+  }
   const markerHits = CERTIFICATE_TEMPLATE_MARKERS.filter((marker) => markerSource.includes(marker.toLowerCase())).length;
   const templateFieldValues = options.templateFieldValues || {};
   const templateFieldHits = Object.entries(templateFieldValues)
@@ -3076,7 +3521,7 @@ function selectCertificateTemplateFieldValue(field, candidates = []) {
   if (fieldKey === normalizeFieldLabel("证书编号")) {
     const strongStructuredCandidate = ranked.find((candidate) => (
       candidate.source === "structured"
-      && looksLikeCertificateIdentifier(candidate.value)
+      && (looksLikeCertificateIdentifier(candidate.value) || looksLikeStructuredReportNumber(candidate.value))
       && candidate.score >= getStrongFieldScoreThreshold(field)
     ));
     if (strongStructuredCandidate) {
@@ -3208,7 +3653,7 @@ function extractFieldValueFromText(text, field) {
 
 function getLockedRecordFieldValue(record, field) {
   if (
-    record.documentProfile === CERTIFICATE_TEMPLATE_PROFILE_ID
+    isCertificateTemplateProfile(record.documentProfile)
     && isCertificateTemplateField(field)
   ) {
     return normalizeFieldValueForOutput(field, record.templateFieldValues?.[field] || "");
@@ -3216,25 +3661,38 @@ function getLockedRecordFieldValue(record, field) {
   return "";
 }
 
-function syncValuesFromContent(record) {
+function syncValuesFromContent(record, fields = state.fields) {
   const filenameFieldValues = parseStructuredFilenameFieldValues(record.originalName);
   const trustStructuredFilename = shouldTrustStructuredFilename(record, filenameFieldValues);
+  const trustStructuredFilenameMetadata = hasStructuredFilenameFieldAgreement(record, filenameFieldValues);
   const documentOverrides = buildDocumentFieldOverrides(record);
+  const allowFilenameFallback = !shouldDisableFilenameFallbackForDiagnostics();
+  const allowKnownAddressFallback = !shouldDisableKnownAddressFallbackForDiagnostics();
 
-  state.fields.forEach((field) => {
+  fields.forEach((field) => {
     const previousAuto = record.autoValues[field] || "";
+    const fieldKey = normalizeFieldLabel(field);
     const lockedValue = getLockedRecordFieldValue(record, field);
     const filenameFallback = getFilenameFallbackFieldValue(field, filenameFieldValues);
     const overrideValue = documentOverrides?.values?.[field];
     let extracted = typeof overrideValue === "string"
       ? overrideValue
       : (lockedValue || extractFieldValueFromText(record.contentText, field));
-    if (((!normalizeWhitespace(extracted) || trustStructuredFilename) || shouldUseFilenameFallbackForField(field, extracted, filenameFallback)) && filenameFallback) {
+    const shouldPreferStructuredFilenameMetadata = trustStructuredFilenameMetadata
+      && filenameFallback
+      && (
+        fieldKey === normalizeFieldLabel("客户名称")
+        || fieldKey === normalizeFieldLabel("地址")
+      );
+    if (
+      allowFilenameFallback
+      && (((!normalizeWhitespace(extracted) || trustStructuredFilename) || shouldUseFilenameFallbackForField(field, extracted, filenameFallback) || shouldPreferStructuredFilenameMetadata) && filenameFallback)
+    ) {
       extracted = field === "客户名称"
         ? mergeCorruptedChineseText(filenameFallback, extracted)
         : filenameFallback;
     }
-    if (!normalizeWhitespace(extracted) && normalizeFieldLabel(field) === normalizeFieldLabel("地址")) {
+    if (!normalizeWhitespace(extracted) && allowKnownAddressFallback && fieldKey === normalizeFieldLabel("地址")) {
       const knownAddress = getKnownCustomerAddress(
         record.values["客户名称"]
         || record.autoValues["客户名称"]
@@ -3253,16 +3711,54 @@ function syncValuesFromContent(record) {
       record.values[field] = extracted || "";
     }
   });
+
+  repairFilenameFallbackArtifacts(record, filenameFieldValues);
 }
 
 function getPdfOcrTargetFields(record) {
-  const missingFields = getMissingFieldList(record);
-  if (!looksLikeCertificateFieldSelection(state.fields)) {
-    return missingFields;
+  if (shouldForcePdfOcrForDiagnostics()) {
+    return state.fields.filter((field) => !normalizeWhitespace(getLockedRecordFieldValue(record, field)));
   }
 
-  const templateFields = getCertificateTemplateFields(state.fields);
-  return [...new Set([...missingFields, ...templateFields])];
+  return state.fields.filter((field) => {
+    const lockedValue = getLockedRecordFieldValue(record, field);
+    if (normalizeWhitespace(lockedValue)) {
+      return false;
+    }
+
+    const extractedValue = normalizeFieldValueForOutput(
+      field,
+      record.autoValues?.[field] || record.values?.[field] || "",
+    );
+    if (!normalizeWhitespace(extractedValue)) {
+      return true;
+    }
+
+    return !isStrongExtractedValue(field, extractedValue, {
+      documentProfile: record.documentProfile,
+      templateFieldValues: record.templateFieldValues,
+    });
+  });
+}
+
+function getEarlyRegionPriorityFields(fields = []) {
+  const priorityKeys = new Set([
+    normalizeFieldLabel("证书编号"),
+    normalizeFieldLabel("客户名称"),
+    normalizeFieldLabel("仪器名称"),
+  ]);
+  return fields.filter((field) => priorityKeys.has(normalizeFieldLabel(field)));
+}
+
+function hasPendingPdfOcrWork(record) {
+  if (!record || record.extensionLower !== ".pdf") {
+    return false;
+  }
+  const targetFields = getPdfOcrTargetFields(record);
+  if (!targetFields.length) {
+    return false;
+  }
+  return !hasAttemptedOcrFieldSet(record, normalizeFieldSetKey(targetFields));
 }
 
 async function getPdfJsLib() {
@@ -3284,8 +3780,30 @@ async function getPdfJsLib() {
 }
 
 async function extractPdfText(file) {
+  const hashStartedAt = getNowMs();
+  const fileHash = await getFileFingerprint(file);
+  const fileHashMs = getElapsedMs(hashStartedAt);
+  const cacheKey = buildExtractionCacheKey({
+    kind: "pdf-text",
+    fileHash,
+    page: 1,
+  });
+  const cached = getCachedExtractionArtifact(cacheKey);
+  if (cached) {
+    return {
+      text: cached.text || "",
+      fileHash,
+      timings: {
+        file_hash_ms: fileHashMs,
+        pdf_text_extract_ms: 0,
+        pdf_text_cache_hit: true,
+      },
+    };
+  }
+
+  const extractStartedAt = getNowMs();
   const pdfjsLib = await getPdfJsLib();
-  const documentTask = pdfjsLib.getDocument({ data: new Uint8Array(await file.arrayBuffer()) });
+  const documentTask = pdfjsLib.getDocument({ data: new Uint8Array(await getFileArrayBuffer(file)) });
   const pdf = await documentTask.promise;
   const chunks = [];
   const pageCount = Math.min(pdf.numPages, PDF_MAX_PAGES_TO_READ);
@@ -3331,29 +3849,84 @@ async function extractPdfText(file) {
     const pageText = lines.join("\n");
     chunks.push(pageText);
   }
-  return chunks.join("\n");
+  const text = chunks.join("\n");
+  setCachedExtractionArtifact(cacheKey, { text });
+  return {
+    text,
+    fileHash,
+    timings: {
+      file_hash_ms: fileHashMs,
+      pdf_text_extract_ms: getElapsedMs(extractStartedAt),
+      pdf_text_cache_hit: false,
+    },
+  };
 }
 
-async function extractPdfTextWithOcr(file, fields = state.fields) {
+async function extractPdfTextWithOcr(file, fields = state.fields, options = {}) {
+  const hashStartedAt = getNowMs();
+  const fileHash = options.fileHash || await getFileFingerprint(file);
+  const fileHashMs = options.fileHash ? 0 : getElapsedMs(hashStartedAt);
+  const fieldSetKey = normalizeFieldSetKey(fields);
+  const templateFamily = getTemplateFamilyHint(fields, options.documentProfile || "");
+  const cacheKey = buildExtractionCacheKey({
+    kind: "pdf-ocr",
+    fileHash,
+    page: 1,
+    templateFamily,
+    fieldSet: fieldSetKey,
+  });
+  const cached = getCachedExtractionArtifact(cacheKey);
+  if (cached) {
+    return {
+      ...cached,
+      fileHash,
+      fieldSetKey,
+      timings: {
+        file_hash_ms: fileHashMs,
+        ocr_render_ms: 0,
+        ocr_region_ms: 0,
+        ocr_fullpage_ms: 0,
+        postprocess_ms: 0,
+        ocr_cache_hit: true,
+      },
+    };
+  }
+
   const pdfjsLib = await getPdfJsLib();
-  const documentTask = pdfjsLib.getDocument({ data: new Uint8Array(await file.arrayBuffer()) });
+  const documentTask = pdfjsLib.getDocument({ data: new Uint8Array(await getFileArrayBuffer(file)) });
   const pdf = await documentTask.promise;
-  const worker = await getOcrWorker();
+  const worker = await getOcrWorker(options.workerSlot || 0);
   const pageCount = Math.min(pdf.numPages, PDF_MAX_PAGES_TO_READ);
   const chunks = [];
   const pageDiagnostics = [];
   let mergedTemplateFieldValues = {};
   let documentProfile = "";
+  let ocrRenderMs = 0;
+  let ocrRegionMs = 0;
+  let ocrFullpageMs = 0;
+  let postprocessMs = 0;
 
   for (let pageNumber = 1; pageNumber <= pageCount; pageNumber += 1) {
     const page = await pdf.getPage(pageNumber);
+    const renderStartedAt = getNowMs();
     const canvas = await renderPdfPageToCanvas(page, 3, 180);
     const rawCanvas = pageNumber === 1 && shouldRenderRawCanvasForFields(fields)
       ? await renderPdfPageToCanvas(page, 3, 0)
       : null;
-    const regionFirst = await buildPreciseRegionStructuredText(canvas, rawCanvas, worker, fields, pageNumber);
-    const regionStructuredText = normalizeExtractedText(regionFirst.text);
-    const unresolvedFields = regionFirst.unresolvedFields;
+    ocrRenderMs += getElapsedMs(renderStartedAt);
+
+    const shouldDeferRegionFirst = fields.length > 3 && !shouldForcePdfOcrForDiagnostics();
+    let regionStructuredText = "";
+    let unresolvedFields = [...fields];
+    const regionFirstFields = shouldDeferRegionFirst ? getEarlyRegionPriorityFields(fields) : fields;
+    if (regionFirstFields.length) {
+      const regionStartedAt = getNowMs();
+      const regionFirst = await buildPreciseRegionStructuredText(canvas, rawCanvas, worker, regionFirstFields, pageNumber);
+      ocrRegionMs += getElapsedMs(regionStartedAt);
+      regionStructuredText = normalizeExtractedText(regionFirst.text);
+      unresolvedFields = fields.filter((field) => !normalizeWhitespace(extractFieldValueFromText(regionStructuredText, field)));
+    }
+    const regionPostprocessStartedAt = getNowMs();
     const regionTemplateBundle = extractCertificateTemplateFieldBundle({
       structuredText: regionStructuredText,
       rawText: "",
@@ -3368,6 +3941,7 @@ async function extractPdfTextWithOcr(file, fields = state.fields) {
       templateFieldValues: mergedTemplateFieldValues,
       fields,
     });
+    postprocessMs += getElapsedMs(regionPostprocessStartedAt);
 
     if (!unresolvedFields.length) {
       if (regionStructuredText) {
@@ -3391,11 +3965,45 @@ async function extractPdfTextWithOcr(file, fields = state.fields) {
       user_defined_dpi: "300",
     });
 
+    const fullpageStartedAt = getNowMs();
     const result = await worker.recognize(canvas, {}, { tsv: true });
+    ocrFullpageMs += getElapsedMs(fullpageStartedAt);
     const rawText = normalizeExtractedText(result?.data?.text || "");
     const ocrLines = parseTesseractTsv(result?.data?.tsv || "");
-    const structuredText = await buildStructuredTextFromOcrPage(canvas, rawCanvas, worker, ocrLines, unresolvedFields, pageNumber);
-    const combinedStructuredText = normalizeExtractedText([regionStructuredText, structuredText].filter(Boolean).join("\n"));
+    const tentativeProfile = detectCertificateDocumentProfile({
+      rawText,
+      templateFieldValues: mergedTemplateFieldValues,
+      fields,
+    });
+    const profileRegionStartedAt = getNowMs();
+    const profileRegionText = tentativeProfile === GIMT_CERTIFICATE_PROFILE_ID
+      ? await buildGimtProfileStructuredText(canvas, rawCanvas, worker, unresolvedFields)
+      : "";
+    ocrRegionMs += getElapsedMs(profileRegionStartedAt);
+    const rawCombinedText = normalizeExtractedText([regionStructuredText, rawText].filter(Boolean).join("\n"));
+    const rawStructuredText = buildStructuredFieldLinesFromText(rawCombinedText, unresolvedFields);
+    const preStructuredText = normalizeExtractedText([regionStructuredText, profileRegionText, rawStructuredText].filter(Boolean).join("\n"));
+    const unresolvedAfterPre = unresolvedFields.filter((field) => {
+      const extractedValue = normalizeFieldValueForOutput(field, extractFieldValueFromText(preStructuredText, field));
+      if (!normalizeWhitespace(extractedValue)) {
+        return true;
+      }
+      if (normalizeFieldLabel(field) === normalizeFieldLabel("证书编号") && isAmbiguousCertificateIdentifierValue(extractedValue)) {
+        return true;
+      }
+      return !isStrongExtractedValue(field, extractedValue, {
+        documentProfile: tentativeProfile || documentProfile,
+        templateFieldValues: mergedTemplateFieldValues,
+      });
+    });
+    let structuredText = rawStructuredText;
+    if (unresolvedAfterPre.length) {
+      const structuredRegionStartedAt = getNowMs();
+      structuredText = await buildStructuredTextFromOcrPage(canvas, rawCanvas, worker, ocrLines, unresolvedAfterPre, pageNumber);
+      ocrRegionMs += getElapsedMs(structuredRegionStartedAt);
+    }
+    const combinedStructuredText = normalizeExtractedText([regionStructuredText, profileRegionText, structuredText].filter(Boolean).join("\n"));
+    const templatePostprocessStartedAt = getNowMs();
     const templateBundle = extractCertificateTemplateFieldBundle({
       structuredText: combinedStructuredText,
       rawText,
@@ -3405,15 +4013,17 @@ async function extractPdfTextWithOcr(file, fields = state.fields) {
       ...mergedTemplateFieldValues,
       ...templateBundle.values,
     };
-    documentProfile = documentProfile || detectCertificateDocumentProfile({
+    documentProfile = documentProfile || tentativeProfile || detectCertificateDocumentProfile({
       rawText,
       templateFieldValues: mergedTemplateFieldValues,
       fields,
     });
+    postprocessMs += getElapsedMs(templatePostprocessStartedAt);
     pageDiagnostics.push({
       pageNumber,
       unresolvedFields,
       regionStructuredText,
+      profileRegionText,
       structuredText,
       rawTextPreview: rawText.slice(0, 2000),
       templateFieldValues: templateBundle.values,
@@ -3429,10 +4039,12 @@ async function extractPdfTextWithOcr(file, fields = state.fields) {
     }
   }
 
-  return {
+  const ocrResult = {
     text: chunks.join("\n\n"),
+    fileHash,
+    fieldSetKey,
     documentProfile,
-    templateFieldValues: documentProfile === CERTIFICATE_TEMPLATE_PROFILE_ID ? mergedTemplateFieldValues : {},
+    templateFieldValues: isCertificateTemplateProfile(documentProfile) ? mergedTemplateFieldValues : {},
     templateDiagnostics: looksLikeCertificateFieldSelection(fields)
       ? {
         ocr: {
@@ -3442,7 +4054,17 @@ async function extractPdfTextWithOcr(file, fields = state.fields) {
         },
       }
       : null,
+    timings: {
+      file_hash_ms: fileHashMs,
+      ocr_render_ms: ocrRenderMs,
+      ocr_region_ms: ocrRegionMs,
+      ocr_fullpage_ms: ocrFullpageMs,
+      postprocess_ms: postprocessMs,
+      ocr_cache_hit: false,
+    },
   };
+  setCachedExtractionArtifact(cacheKey, ocrResult);
+  return ocrResult;
 }
 
 function xmlToPlainText(xml) {
@@ -3486,7 +4108,9 @@ async function readTextFromFile(record) {
   }
 
   if (ext === ".pdf") {
-    const extractedText = await extractPdfText(record.file);
+    const extractedPdf = await extractPdfText(record.file);
+    const extractedText = extractedPdf.text;
+    const basePostprocessStartedAt = getNowMs();
     const baseTemplateBundle = extractCertificateTemplateFieldBundle({
       structuredText: extractedText,
       rawText: extractedText,
@@ -3502,8 +4126,13 @@ async function readTextFromFile(record) {
       state: "ready",
       message: normalizeExtractedText(extractedText) ? "PDF 内容读取完成" : "PDF 没有可直接提取的文字，准备尝试 OCR",
       typeLabel: "PDF",
+      fileHash: extractedPdf.fileHash,
+      timings: {
+        ...(extractedPdf.timings || {}),
+        postprocess_ms: getElapsedMs(basePostprocessStartedAt),
+      },
       documentProfile,
-      templateFieldValues: documentProfile === CERTIFICATE_TEMPLATE_PROFILE_ID ? baseTemplateBundle.values : {},
+      templateFieldValues: isCertificateTemplateProfile(documentProfile) ? baseTemplateBundle.values : {},
       templateDiagnostics: looksLikeCertificateFieldSelection(state.fields)
         ? {
           base: {
@@ -3577,10 +4206,13 @@ function applyBackendExtractionPayload(record, payload = {}) {
   record.contentState = payload.contentState || "ready";
   record.contentTypeLabel = payload.contentTypeLabel || (record.extensionLower === ".pdf" ? "PDF" : record.contentTypeLabel);
   record.ocrAttempted = Boolean(payload.ocrAttempted || record.ocrContentText);
+  record.ocrAttemptedFieldSetKeys = [...new Set([...(record.ocrAttemptedFieldSetKeys || []), ...(payload.ocrAttemptedFieldSetKeys || [])])];
   replaceRecordExtractionMetadata(record, {
     documentProfile: payload.documentProfile || "",
+    fileHash: payload.fileHash || "",
     templateFieldValues: payload.templateFieldValues || {},
     templateDiagnostics: payload.templateDiagnostics || null,
+    timings: payload.extractionTimings || payload.timings || {},
   });
 
   state.fields.forEach((field) => {
@@ -3624,9 +4256,7 @@ function shouldUseBackendForRecord(record, options = {}) {
     return true;
   }
 
-  return record.contentState === "ready"
-    && !record.ocrAttempted
-    && getPdfOcrTargetFields(record).length > 0;
+  return record.contentState === "ready" && hasPendingPdfOcrWork(record);
 }
 
 async function ensureBackendAvailability(force = false) {
@@ -3742,6 +4372,7 @@ async function extractRecordsWithBackend(records, options = {}, runId = state.ex
 }
 
 async function populateRecordFromContent(record, options = {}) {
+  const totalStartedAt = getNowMs();
   const { reReadContent = false } = options;
   if (reReadContent) {
     resetRecordExtractionArtifacts(record);
@@ -3763,30 +4394,36 @@ async function populateRecordFromContent(record, options = {}) {
     if (record.contentState === "ready") {
       syncValuesFromContent(record);
       const ocrTargetFields = getPdfOcrTargetFields(record);
+      const ocrFieldSetKey = normalizeFieldSetKey(ocrTargetFields);
 
       if (
         record.extensionLower === ".pdf"
-        && !record.ocrAttempted
         && ocrTargetFields.length
+        && !hasAttemptedOcrFieldSet(record, ocrFieldSetKey)
       ) {
-        const queuedTask = enqueueOcrTask(async () => {
+        const queuedTask = enqueueOcrTask(async (workerSlot) => {
           record.contentState = "reading";
           record.contentMessage = "正在识别扫描版 PDF，可能需要 1 分钟左右...";
           renderDataViews();
-          return extractPdfTextWithOcr(record.file, ocrTargetFields);
+          return extractPdfTextWithOcr(record.file, ocrTargetFields, {
+            fileHash: record.fileHash,
+            documentProfile: record.documentProfile,
+            workerSlot,
+          });
         });
         record.contentState = "reading";
         record.contentMessage = buildQueuedOcrMessage(queuedTask.queuePosition);
         renderDataViews();
         const ocrResult = await queuedTask.promise;
         record.ocrAttempted = true;
+        markAttemptedOcrFieldSet(record, ocrResult?.fieldSetKey || ocrFieldSetKey);
         record.contentState = "ready";
+        applyRecordExtractionMetadata(record, ocrResult);
 
         if (normalizeExtractedText(ocrResult?.text || "")) {
           record.ocrContentText = mergeOcrExtractionText(record.ocrContentText, ocrResult.text, state.fields);
-          applyRecordExtractionMetadata(record, ocrResult);
           updateRecordContentText(record);
-          syncValuesFromContent(record);
+          syncValuesFromContent(record, ocrTargetFields);
         }
       }
 
@@ -3796,6 +4433,10 @@ async function populateRecordFromContent(record, options = {}) {
     console.error(error);
     record.contentState = "error";
     record.contentMessage = `读取文件内容失败：${formatErrorMessage(error)}`;
+  } finally {
+    mergeRecordTimings(record, {
+      total_extract_ms: getElapsedMs(totalStartedAt),
+    });
   }
 }
 
@@ -3818,18 +4459,23 @@ async function runAutoExtraction(records = state.files, options = {}) {
 
   const runId = ++state.extractionRunId;
   state.isExtracting = true;
+  const backendEligibility = new Map();
   records.forEach((record) => {
+    if (!options.reReadContent && record.contentText && record.contentState === "ready") {
+      syncValuesFromContent(record);
+    }
+    backendEligibility.set(record.id, shouldUseBackendForRecord(record, options));
     if (options.reReadContent) {
       resetRecordExtractionArtifacts(record);
     }
     record.contentState = "reading";
-    record.contentMessage = shouldUseBackendForRecord(record, options)
+    record.contentMessage = backendEligibility.get(record.id)
       ? "正在通过本地后端读取 PDF 内容..."
       : "正在读取文件内容...";
   });
   renderDataViews();
 
-  const backendRecords = records.filter((record) => shouldUseBackendForRecord(record, options));
+  const backendRecords = records.filter((record) => backendEligibility.get(record.id));
   let handledByBackend = new Set();
   if (backendRecords.length && await ensureBackendAvailability()) {
     handledByBackend = await extractRecordsWithBackend(backendRecords, options, runId);

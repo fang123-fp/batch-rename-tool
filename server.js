@@ -12,11 +12,22 @@ const port = Number(process.env.PORT || 8123);
 const rootDir = __dirname;
 const baseDir = path.resolve(rootDir);
 const tempRootDir = path.join(baseDir, '.tmp');
-const APP_VERSION = '20260611-scanfix3';
+const APP_VERSION = '20260612-phase01opt1';
 const maxUploadFiles = Number(process.env.MAX_UPLOAD_FILES || 200);
 const maxUploadFileSize = Number(process.env.MAX_UPLOAD_FILE_SIZE || 50 * 1024 * 1024);
 
 let browserPromise = null;
+let workerPageState = null;
+let workerPageRunPromise = Promise.resolve();
+let workerPageWarmPromise = null;
+
+function getNowMs() {
+  return Date.now();
+}
+
+function getElapsedMs(startedAt) {
+  return Math.max(0, getNowMs() - startedAt);
+}
 
 function formatErrorMessage(error) {
   if (error && typeof error.message === 'string' && error.message.trim()) {
@@ -154,6 +165,10 @@ async function getBrowser() {
 }
 
 async function closeBrowser() {
+  if (workerPageState?.page) {
+    await workerPageState.page.close().catch(() => {});
+    workerPageState = null;
+  }
   if (!browserPromise) {
     return;
   }
@@ -167,18 +182,9 @@ async function closeBrowser() {
   }
 }
 
-async function extractFilesWithBrowser(options) {
-  const {
-    files,
-    fields,
-    recordIds,
-    requestOptions,
-  } = options;
-  const browser = await getBrowser();
-  const page = await browser.newPage();
+async function createWorkerPage(browser, timeoutMs) {
   const workerUrl = buildWorkerUrl();
-  const timeoutMs = Math.max(180000, Math.min(1800000, files.length * 60000));
-
+  const page = await browser.newPage();
   page.setDefaultTimeout(timeoutMs);
   page.setDefaultNavigationTimeout(timeoutMs);
   await page.setViewport({ width: 1440, height: 1200, deviceScaleFactor: 1 });
@@ -186,75 +192,194 @@ async function extractFilesWithBrowser(options) {
   page.on('pageerror', (error) => {
     console.error('Worker page error:', formatErrorMessage(error));
   });
+  await page.goto(workerUrl, { waitUntil: 'networkidle2' });
+  await page.waitForSelector('#fileInput');
+  return {
+    page,
+    workerUrl,
+  };
+}
 
-  try {
-    await page.goto(workerUrl, { waitUntil: 'networkidle2' });
-    await page.waitForSelector('#fileInput');
-
-    await page.evaluate(({ workerFields, workerTemplate }) => {
-      state.fields = [...workerFields];
-      state.pendingFields = [];
-      state.files = [];
-      state.template = workerTemplate;
-      state.status = '服务端工作页初始化完成';
-      state.statusKind = '';
-      state.isExtracting = false;
-      state.extractionRunId = 0;
-      state.activeExtractionPromise = null;
-      state.pendingExtractionRequest = null;
-      state.focusPendingFieldId = '';
-      state.backendStatus = 'disabled';
-      state.backendMessage = '服务端工作页已禁用本地后端递归调用';
-      ocrQueueTail = Promise.resolve();
-      activeOcrJobCount = 0;
-      waitingOcrJobCount = 0;
-      fileInput.value = '';
-      templateInput.value = state.template;
-      render();
-    }, {
-      workerFields: fields,
-      workerTemplate: buildTemplateFromFields(fields),
-    });
-
-    const input = await page.$('#fileInput');
-    if (!input) {
-      throw new Error('服务端工作页缺少文件上传输入框');
-    }
-
-    await input.uploadFile(...files.map((file) => file.path));
-    await page.waitForFunction((expectedCount) => state.files.length === expectedCount, {}, files.length);
-    await page.waitForFunction((expectedCount) => (
-      state.files.length === expectedCount
-      && !state.isExtracting
-      && !state.activeExtractionPromise
-      && state.files.every((record) => record.contentState !== 'reading')
-    ), { timeout: timeoutMs }, files.length);
-
-    const snapshot = await page.evaluate(() => buildDiagnosticsSnapshot());
-    const rows = Array.isArray(snapshot?.records) ? snapshot.records : [];
-
-    return rows.map((row, index) => ({
-      recordId: recordIds[index] || '',
-      originalName: files[index]?.originalname || row.originalName || '',
-      contentState: row.contentState,
-      contentMessage: row.contentMessage,
-      contentTypeLabel: row.contentTypeLabel,
-      ocrAttempted: Boolean(row.ocrAttempted),
-      documentProfile: row.documentProfile || '',
-      values: row.values || {},
-      autoValues: row.autoValues || {},
-      templateFieldValues: row.templateFieldValues || {},
-      baseContentText: row.baseContentText || '',
-      ocrContentText: row.ocrContentText || '',
-      contentText: row.contentText || '',
-      templateDiagnostics: row.templateDiagnostics || null,
-      workerBackendStatus: snapshot.backendStatus || '',
-      workerBackendMessage: snapshot.backendMessage || '',
-      requestedStrictCertificateMode: Boolean(requestOptions?.strictCertificateMode),
-    }));
-  } finally {
-    await page.close().catch(() => {});
+async function getWorkerPage(timeoutMs) {
+  const browser = await getBrowser();
+  if (workerPageState?.page && !workerPageState.page.isClosed()) {
+    workerPageState.page.setDefaultTimeout(timeoutMs);
+    workerPageState.page.setDefaultNavigationTimeout(timeoutMs);
+    return {
+      page: workerPageState.page,
+      workerPageBootMs: 0,
+      workerPageReused: true,
+    };
   }
+
+  const bootStartedAt = getNowMs();
+  const nextState = await createWorkerPage(browser, timeoutMs);
+  workerPageState = nextState;
+  return {
+    page: nextState.page,
+    workerPageBootMs: getElapsedMs(bootStartedAt),
+    workerPageReused: false,
+  };
+}
+
+async function resetWorkerPage(page, fields, requestOptions = {}) {
+  await page.evaluate(({ workerFields, workerTemplate, workerRequestOptions }) => {
+    state.fields = [...workerFields];
+    state.pendingFields = [];
+    state.files = [];
+    state.template = workerTemplate;
+    state.status = '服务端工作页初始化完成';
+    state.statusKind = '';
+    state.isExtracting = false;
+    state.extractionRunId = 0;
+    state.activeExtractionPromise = null;
+    state.pendingExtractionRequest = null;
+    state.focusPendingFieldId = '';
+    state.backendStatus = 'disabled';
+    state.backendMessage = '服务端工作页已禁用本地后端递归调用';
+    pendingOcrTasks.length = 0;
+    activeOcrJobCount = 0;
+    waitingOcrJobCount = 0;
+    serverWorkerOriginalNamesQueue = [];
+    activeWorkerRequestOptions = { ...(workerRequestOptions || {}) };
+    if (activeOcrWorkerSlots?.clear) {
+      activeOcrWorkerSlots.clear();
+    }
+    fileInput.value = '';
+    templateInput.value = workerTemplate;
+    render();
+  }, {
+    workerFields: fields,
+    workerTemplate: buildTemplateFromFields(fields),
+    workerRequestOptions: requestOptions,
+  });
+}
+
+function runSerializedOnWorkerPage(task) {
+  const nextRun = workerPageRunPromise
+    .catch(() => {})
+    .then(task);
+  workerPageRunPromise = nextRun.catch(() => {});
+  return nextRun;
+}
+
+function warmWorkerPageResources() {
+  if (!workerPageWarmPromise) {
+    workerPageWarmPromise = runSerializedOnWorkerPage(async () => {
+      const { page } = await getWorkerPage(180000);
+      await page.evaluate(async () => {
+        try {
+          await getPdfJsLib();
+        } catch (_error) {
+          // Ignore prewarm failures and let request-time path retry.
+        }
+        try {
+          await ensureTesseractLoaded();
+        } catch (_error) {
+          // Ignore prewarm failures and let request-time path retry.
+        }
+
+        const warmWorkerCount = Math.max(1, Math.min(2, Number(OCR_CONCURRENCY_LIMIT) || 1));
+        await Promise.all(Array.from({ length: warmWorkerCount }, async (_unused, slot) => {
+          try {
+            await getOcrWorker(slot);
+          } catch (_error) {
+            // Ignore prewarm failures and let request-time path retry.
+          }
+        }));
+      });
+    }).catch((error) => {
+      workerPageWarmPromise = null;
+      throw error;
+    });
+  }
+  return workerPageWarmPromise;
+}
+
+function isRetryableWorkerPageError(error) {
+  const message = formatErrorMessage(error);
+  return /frame got detached|waitForFunction failed|Waiting failed|ERR_CONNECTION_REFUSED|Target closed|Session closed|Protocol error/i.test(message);
+}
+
+async function extractFilesWithBrowser(options) {
+  const {
+    files,
+    fields,
+    recordIds,
+    requestOptions,
+  } = options;
+  return runSerializedOnWorkerPage(async () => {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const timeoutMs = Math.max(180000, Math.min(1800000, files.length * 60000));
+      const workerExtractStartedAt = getNowMs();
+      const { page, workerPageBootMs, workerPageReused } = await getWorkerPage(timeoutMs);
+
+      try {
+        await resetWorkerPage(page, fields, requestOptions);
+
+      const input = await page.$('#fileInput');
+      if (!input) {
+        throw new Error('服务端工作页缺少文件上传输入框');
+      }
+
+      await page.evaluate((originalNames) => {
+        serverWorkerOriginalNamesQueue = [...originalNames];
+      }, files.map((file) => file.originalname || ''));
+      await input.uploadFile(...files.map((file) => file.path));
+      await page.waitForFunction((expectedCount) => state.files.length === expectedCount, {}, files.length);
+      await page.waitForFunction((expectedCount) => (
+        state.files.length === expectedCount
+        && !state.isExtracting
+          && !state.activeExtractionPromise
+          && state.files.every((record) => record.contentState !== 'reading')
+        ), { timeout: timeoutMs }, files.length);
+
+        const snapshot = await page.evaluate(() => buildDiagnosticsSnapshot());
+        const rows = Array.isArray(snapshot?.records) ? snapshot.records : [];
+
+        return {
+          files: rows.map((row, index) => ({
+            recordId: recordIds[index] || '',
+            originalName: files[index]?.originalname || row.originalName || '',
+            contentState: row.contentState,
+            contentMessage: row.contentMessage,
+            contentTypeLabel: row.contentTypeLabel,
+            ocrAttempted: Boolean(row.ocrAttempted),
+            ocrAttemptedFieldSetKeys: row.ocrAttemptedFieldSetKeys || [],
+            documentProfile: row.documentProfile || '',
+            fileHash: row.fileHash || '',
+            timings: row.extractionTimings || {},
+            values: row.values || {},
+            autoValues: row.autoValues || {},
+            templateFieldValues: row.templateFieldValues || {},
+            baseContentText: row.baseContentText || '',
+            ocrContentText: row.ocrContentText || '',
+            contentText: row.contentText || '',
+            templateDiagnostics: row.templateDiagnostics || null,
+            workerBackendStatus: snapshot.backendStatus || '',
+            workerBackendMessage: snapshot.backendMessage || '',
+            requestedStrictCertificateMode: Boolean(requestOptions?.strictCertificateMode),
+          })),
+          timings: {
+            worker_page_boot_ms: workerPageBootMs,
+            worker_page_reused: workerPageReused,
+            worker_extract_ms: getElapsedMs(workerExtractStartedAt),
+            worker_page_retry_count: attempt,
+          },
+        };
+      } catch (error) {
+        if (workerPageState?.page === page) {
+          await page.close().catch(() => {});
+          workerPageState = null;
+        }
+        if (attempt > 0 || !isRetryableWorkerPageError(error)) {
+          throw error;
+        }
+        await closeBrowser();
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+    }
+  });
 }
 
 const app = express();
@@ -275,6 +400,7 @@ app.use(express.static(baseDir, {
 app.get('/api/health', async (_request, response) => {
   try {
     const browserInfo = resolveBrowserLaunchOptions();
+    await warmWorkerPageResources().catch(() => {});
     response.json({
       ok: true,
       message: `本地后端已就绪，当前使用 ${browserInfo.browserName}`,
@@ -321,11 +447,18 @@ async function prepareUploadTempDir(request, _response, next) {
   }
 }
 
-app.post('/api/extract', prepareUploadTempDir, upload.array('files', maxUploadFiles), async (request, response) => {
+function markRequestStart(request, _response, next) {
+  request.requestStartedAt = getNowMs();
+  next();
+}
+
+app.post('/api/extract', markRequestStart, prepareUploadTempDir, upload.array('files', maxUploadFiles), async (request, response) => {
   const fields = safeJsonParse(request.body.fields, []).map((field) => String(field || '').trim()).filter(Boolean);
   const recordIds = safeJsonParse(request.body.recordIds, []);
   const requestOptions = safeJsonParse(request.body.options, {});
   const files = Array.isArray(request.files) ? request.files : [];
+  const backendUploadMs = getElapsedMs(request.requestStartedAt || getNowMs());
+  const requestStartedAt = getNowMs();
 
   try {
     if (!files.length) {
@@ -337,7 +470,7 @@ app.post('/api/extract', prepareUploadTempDir, upload.array('files', maxUploadFi
       return;
     }
 
-    const extractedFiles = await extractFilesWithBrowser({
+    const extractionResult = await extractFilesWithBrowser({
       files,
       fields,
       recordIds,
@@ -347,8 +480,13 @@ app.post('/api/extract', prepareUploadTempDir, upload.array('files', maxUploadFi
     response.json({
       ok: true,
       appVersion: APP_VERSION,
-      message: `本地后端已完成 ${extractedFiles.length} 份文件的统一识别`,
-      files: extractedFiles,
+      message: `本地后端已完成 ${extractionResult.files.length} 份文件的统一识别`,
+      timings: {
+        backend_upload_ms: backendUploadMs,
+        total_request_ms: getElapsedMs(requestStartedAt) + backendUploadMs,
+        ...extractionResult.timings,
+      },
+      files: extractionResult.files,
     });
   } catch (error) {
     console.error('Extraction API failed:', error);
@@ -385,6 +523,13 @@ const server = app.listen(port, host, async () => {
   } catch (error) {
     console.warn(`Backend browser not ready: ${formatErrorMessage(error)}`);
   }
+  warmWorkerPageResources()
+    .then(() => {
+      console.log('Worker page prewarm completed.');
+    })
+    .catch((error) => {
+      console.warn(`Worker page prewarm failed: ${formatErrorMessage(error)}`);
+    });
   console.log('Press Ctrl+C to stop the server.');
 });
 

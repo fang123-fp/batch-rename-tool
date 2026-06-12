@@ -1,5 +1,94 @@
 # Progress
 
+## 2026-06-12 OCR Root-Cause Closure
+
+### Goal
+- 把 OCR 问题从“定向兜底修复”升级为“可诊断、可复现、可验收的根因修复”
+- 在不破坏 `Phase 0/1` 性能交付线的前提下，消除关键样本对 `filename fallback / known address fallback` 的隐藏依赖
+
+### Delivered
+- 新增根因诊断链路：
+  - [scripts/inspect-ocr-root-cause.js](scripts/inspect-ocr-root-cause.js)
+  - [scripts/run-root-cause-gate.js](scripts/run-root-cause-gate.js)
+- 为服务端 worker 增加诊断开关：
+  - 可关闭 `filename fallback`
+  - 可关闭 `known address fallback`
+  - 可强制所有目标字段走 OCR
+- 已确认并修复两类不同根因：
+  - `Z2025H-C214574-...pdf`
+    - 根因是后处理 / 候选选优层串位
+    - 修复后在关闭关键兜底的情况下，`客户名称/地址/仪器名称/管理编号/校准日期` 都能直接读对
+  - `RE202412366-...pdf`
+    - 根因是 `GIMT` 绿色证书家族没有被当作独立版式处理，且证书号规范化过窄
+    - 已新增 `GIMT` 家族识别和家族级 region OCR 提取
+    - 已补强证书号规范化，覆盖 `RE...`、`Z2025H-C...`、`Z2025N12-G...` 等形态
+- 已将“正常交付线”和“无兜底根因线”都固化成可执行 gate
+
+### Verification
+- `npm test`
+- `npm run test:phase01-gate`
+- `npm run test:root-cause-gate`
+- 独立测试 agent 最终复测：
+  - 三条 gate 全部 `PASS`
+
+### Key Evidence
+- 正常回归产物：
+  - `.tmp/regression/latest.json`
+  - `.tmp/regression/latest.md`
+- 性能 gate 产物：
+  - `.tmp/performance-gate/2026-06-12T04-29-13-528Z-s6XFX8`
+- 根因 gate 产物：
+  - `.tmp/root-cause-gate/2026-06-12T04-30-45-933Z-rGdySh/2026-06-12T04-30-45-963Z`
+
+## 2026-06-12 Phase 0/1 Speed & Accuracy Landing
+
+### Goal
+- 落地 `docs/2026-06-12-speed-accuracy-optimization-plan.md` 中 `Phase 0` 和 `Phase 1` 的高价值项
+- 在不回退 `11/11 PASS` 基线、不引入样本硬编码补丁的前提下，补齐阶段耗时观测、warm page 复用、缓存键与增量 OCR
+
+### Delivered
+- 已给 PDF 文本提取、OCR 渲染、区域 OCR、整页 OCR、后处理补上阶段耗时埋点，并通过 `/api/extract` 透传到回归脚本
+- 已把服务端 Puppeteer 工作页改成单页 warm reuse：
+  - 首次请求建页
+  - 后续请求复用
+  - 页面崩溃/连接异常时自动清理并重试一次
+- 已把 OCR 队列从“单 worker 串行”改成“worker 池 + 有限并发槽位”
+- 已增加真正可复用的缓存层：
+  - `fileHash + page` 的 PDF 文字缓存
+  - `fileHash + page + templateFamily + fieldSet` 的 OCR 结果缓存
+- 已把字段变更后的读取收敛成增量模式：
+  - 默认不再整批 `reRead`
+  - 只对新增/缺失字段补跑 OCR
+  - OCR 合并后只回填本次目标字段，不污染已正确字段
+- 已把后端 `originalname` 直接灌入 worker 页记录，确保结构化文件名 fallback 在后端统一识别路径里也可靠生效
+
+### Verification
+- `node --check app.js`
+- `node --check server.js`
+- `node --check scripts/run-batch-regression.js`
+- `npm test`
+- 最新全量回归：
+  - `total=11`
+  - `pass=11`
+  - `partial=0`
+  - `fail=0`
+  - `totalElapsedMs≈32312`
+- 最新回归产物：
+  - `.tmp/regression/latest.json`
+  - `.tmp/regression/latest.md`
+
+### Notes
+- fresh 场景对比：
+  - `2 字段单文件`：旧实现约 `3406ms` -> 新实现约 `1086ms`
+  - `6 字段单文件`：旧实现约 `5021ms` -> 新实现约 `3499ms`
+  - `6 份批量`：旧实现约 `26692ms` -> 新实现约 `14905ms`
+  - `同 baseUrl 重复读取命中缓存`：旧实现约 `5430ms` -> 新实现约 `34ms`
+- `worker_page_boot_ms` 在预热完成后稳定为 `0`，说明 warm page 复用和启动期预热都已生效
+- 结构化文件名样本在同一轮里出现了 `100ms` 级请求，说明“原始文件名直灌 + 增量同步”已能避免不必要 OCR
+- 剩余风险：
+  - 个别重 OCR 扫描件在 `6 字段单文件` 严格门槛下仍可能高于 `4000ms`
+  - 主要瓶颈仍集中在 `ocr_fullpage_ms` 与部分样本的 `ocr_region_ms`
+
 ## 2026-06-11 Regression Closure
 
 ### Goal
@@ -36,6 +125,20 @@
 - 说明：
   - 当前 11 份样本的 6 个目标字段都已补齐人工真值
   - 批量回归已达到 `11/11 PASS`
+
+## 2026-06-12 Optimization Plan
+
+### Goal
+- 给现有识别链路制定一份能同时提升速度与泛化准确率的具体执行方案
+
+### Status
+- 已完成基于当前代码路径的瓶颈分析
+- 已产出分阶段方案：
+  - [docs/2026-06-12-speed-accuracy-optimization-plan.md](docs/2026-06-12-speed-accuracy-optimization-plan.md)
+
+### Recommendation
+- 推荐按 `Phase 0 -> Phase 1 -> Phase 2 -> Phase 3` 推进
+- 先拿阶段耗时与缓存/复用收益，再做模板家族化和共享核心改造
 
 ## Goal
 - 为静态站提供一版更适合中国大陆访问的部署形态

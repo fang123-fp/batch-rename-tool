@@ -4,84 +4,124 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>批量文件重命名台</title>
-    <link rel="stylesheet" href="./styles.css?v=20260610-localbackend1" />
+    <link rel="stylesheet" href="./styles.css?v=20260612-manualflow1" />
   </head>
   <body>
     <div class="page-shell">
       <header class="hero-card">
-        <div>
-          <p class="eyebrow">Local Batch Rename Console</p>
+        <div class="hero-copy-block">
+          <p class="eyebrow">Product Design</p>
           <h1>批量文件重命名台</h1>
           <p class="hero-copy">
-            选择多个文件后会先按列表显示，再根据你配置的字段和模板批量重命名。
-            原始文件不会被直接改名，下载的 ZIP 里会是重命名后的结果。
+            先上传文件，再配置字段和命名模板，最后通过“批量替换名称”统一开始读取文字。
+            原始文件不会被直接改名，最终下载的是新的 ZIP 结果包。
           </p>
-          <div class="hero-meta">
-            <span id="appVersionBadge" class="badge-pill">当前版本加载中</span>
-            <span class="badge-pill badge-pill-soft">证书 PDF 会优先走第一页模板锁定提取</span>
+        </div>
+        <div class="hero-side">
+          <span id="appVersionBadge" class="badge-pill">当前版本加载中</span>
+          <div class="hero-note">
+            <strong>本次流程已改成手动触发读取</strong>
+            <p>上传后不会自动识别，请先把字段和模板确定好，再点击“批量替换名称”。</p>
           </div>
         </div>
       </header>
 
+      <section class="step-strip" aria-label="主流程">
+        <article class="step-chip">
+          <span>01</span>
+          <strong>上传文件</strong>
+        </article>
+        <article class="step-chip">
+          <span>02</span>
+          <strong>配置字段</strong>
+        </article>
+        <article class="step-chip">
+          <span>03</span>
+          <strong>设置模板</strong>
+        </article>
+        <article class="step-chip">
+          <span>04</span>
+          <strong>批量替换名称</strong>
+        </article>
+      </section>
+
       <main class="workspace-grid">
-        <section class="panel stack-panel upload-panel">
+        <section class="panel upload-panel">
           <div class="panel-head">
-            <h2>1. 上传文件</h2>
+            <div>
+              <p class="panel-kicker">1. 上传文件</p>
+              <h2>先把要处理的文件放进来</h2>
+            </div>
             <button id="clearFilesBtn" class="ghost-btn" type="button">清空文件</button>
           </div>
           <div class="upload-layout">
             <label class="dropzone" for="fileInput" id="dropzone">
               <input id="fileInput" type="file" multiple />
               <span class="dropzone-title">点击或拖拽文件到这里</span>
-              <span class="dropzone-subtitle">支持一次选择多个文件，并自动读取文件内容中的字段</span>
+              <span class="dropzone-subtitle">支持一次选择多份文件，上传后先按列表暂存，不会立刻开始识别。</span>
             </label>
             <div class="selected-files-box">
               <div class="selected-files-head">
-                <strong>已选文件列表</strong>
+                <strong>已选文件</strong>
                 <span id="fileSummary">尚未选择文件</span>
               </div>
-              <div id="selectedFilesEmpty" class="selected-files-empty">上传后会在这里按列表显示文件</div>
+              <div id="selectedFilesEmpty" class="selected-files-empty">上传后会先在这里排队显示</div>
               <ul id="selectedFilesList" class="selected-files-list hidden"></ul>
             </div>
           </div>
           <div class="panel-copy upload-note">
             <span class="upload-note-line">自动读取优先支持 `txt`、`csv`、`json`、`md`、`html`、`pdf`、`docx`。</span>
-            <span class="upload-note-line">字段内容可写成 `姓名: 张三`、`编号：001`、`姓名 张三 编号 001`，或字段名与值分两行。字段名中间就算有空格，比如 `姓 名`、`编 号`，也会自动识别。</span>
-            <span class="upload-note-line">PDF 的 OCR 识别引擎会在首次需要时从站内按需加载，首轮可能稍慢，之后会复用。</span>
+            <span class="upload-note-line">字段内容可写成 `姓名: 张三`、`编号：001`，也支持字段名和值分两行。</span>
+            <span class="upload-note-line">PDF 的 OCR 识别引擎会在首次需要时按需加载，首轮会稍慢。</span>
           </div>
         </section>
 
-        <section class="panel stack-panel">
+        <section class="panel field-panel">
           <div class="panel-head panel-head-break">
-            <h2>2. 配置字段</h2>
-            <button id="addFieldBtn" class="accent-btn" type="button">新增字段</button>
+            <div>
+              <p class="panel-kicker">2. 配置字段</p>
+              <h2>定义需要从内容里读出的信息</h2>
+            </div>
+            <button id="addFieldBtn" class="ghost-btn" type="button">新增字段</button>
           </div>
-          <p class="panel-copy">字段示例：姓名、编号、部门。模板将使用 <code>{字段名}</code> 作为占位符。</p>
+          <p class="panel-copy">字段示例：姓名、编号、部门。模板中会用 <code>{字段名}</code> 作为占位符。</p>
           <div id="fieldList" class="field-list"></div>
         </section>
 
-        <section class="panel stack-panel template-panel">
+        <section class="panel template-panel">
           <div class="panel-head panel-head-break">
-            <h2>3. 设置命名模板</h2>
+            <div>
+              <p class="panel-kicker">3. 设置命名模板</p>
+              <h2>确认模板后再统一替换名称</h2>
+            </div>
             <button id="resetTemplateBtn" class="ghost-btn" type="button">恢复默认</button>
           </div>
           <label class="input-label" for="templateInput">模板</label>
           <input id="templateInput" class="template-input" type="text" value="{姓名}-{编号}" />
           <p id="templateHint" class="hint-text">模板里至少需要一个有效字段占位符。</p>
+          <div class="template-actions">
+            <button id="processFilesBtn" class="accent-btn" type="button">批量替换名称</button>
+            <p class="action-copy">点击后才会开始读取文字、回填字段，并生成表格里的预览名称。</p>
+          </div>
         </section>
 
         <section class="panel table-panel">
           <div class="panel-head">
-            <h2>文件列表</h2>
+            <div>
+              <p class="panel-kicker">4. 检查结果</p>
+              <h2>确认字段值和预览名称</h2>
+            </div>
             <div class="panel-actions">
-              <button id="exportDiagnosticsBtn" class="ghost-btn" type="button">导出诊断信息</button>
-              <button id="reloadExtractBtn" class="ghost-btn" type="button">从内容重新读取</button>
               <button id="clearValuesBtn" class="ghost-btn" type="button">清空字段值</button>
+              <button id="exportDiagnosticsBtn" class="ghost-btn" type="button">导出诊断信息</button>
             </div>
           </div>
+          <div class="results-note">
+            <p>自动读取完成后，字段还可以继续手动修正；预览名称会随模板和字段实时更新。</p>
+          </div>
           <div id="emptyState" class="empty-state">
-            <h3>先上传文件</h3>
-            <p>上传后，这里会按列表展示每个文件，自动从文件内容里读取字段，并把结果填到对应列里。</p>
+            <h3>按顺序完成上面的 1-2-3 步</h3>
+            <p>文件上传后不会自动识别。等字段和模板都确定好，再点击“批量替换名称”，这里才会显示读取结果。</p>
           </div>
           <div id="tableWrap" class="table-wrap hidden">
             <table>
@@ -96,16 +136,17 @@
 
       <footer class="export-bar">
         <div>
-          <strong>执行重命名</strong>
+          <p class="panel-kicker">5. 下载结果</p>
+          <strong>确认无误后导出 ZIP</strong>
           <p id="statusText">等待文件和模板配置完成</p>
         </div>
         <div class="export-actions">
-          <button id="exportZipBtn" class="accent-btn" type="button">重新命名并下载 ZIP</button>
+          <button id="exportZipBtn" class="accent-btn" type="button">下载重命名 ZIP</button>
         </div>
       </footer>
     </div>
 
-    <script src="./vendor/jszip.min.js?v=20260610-localbackend1"></script>
-    <script src="./app.js?v=20260610-localbackend1"></script>
+    <script src="./vendor/jszip.min.js?v=20260612-manualflow1"></script>
+    <script src="./app.js?v=20260612-manualflow1"></script>
   </body>
 </html>

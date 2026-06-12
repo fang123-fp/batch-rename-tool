@@ -3,9 +3,11 @@ const state = {
   pendingFields: [],
   files: [],
   template: "{姓名}-{编号}",
-  status: "等待文件上传和字段读取完成",
+  status: "先上传文件，再配置字段和模板",
   statusKind: "",
   isExtracting: false,
+  needsProcessing: false,
+  hasProcessedFiles: false,
   extractionRunId: 0,
   activeExtractionPromise: null,
   pendingExtractionRequest: null,
@@ -179,7 +181,7 @@ const statusText = document.getElementById("statusText");
 const exportZipBtn = document.getElementById("exportZipBtn");
 const clearFilesBtn = document.getElementById("clearFilesBtn");
 const addFieldBtn = document.getElementById("addFieldBtn");
-const reloadExtractBtn = document.getElementById("reloadExtractBtn");
+const processFilesBtn = document.getElementById("processFilesBtn");
 const clearValuesBtn = document.getElementById("clearValuesBtn");
 const resetTemplateBtn = document.getElementById("resetTemplateBtn");
 const exportDiagnosticsBtn = document.getElementById("exportDiagnosticsBtn");
@@ -193,7 +195,7 @@ let activeOcrJobCount = 0;
 let waitingOcrJobCount = 0;
 const activeOcrWorkerSlots = new Set();
 const OCR_CONCURRENCY_LIMIT = Math.max(1, Math.min(3, Number(new URLSearchParams(window.location.search).get("ocrConcurrency") || "2") || 2));
-const APP_VERSION = "20260612-phase01opt1";
+const APP_VERSION = "20260612-manualflow1";
 const STATIC_ASSET_VERSION = APP_VERSION;
 const BACKEND_DISABLED_BY_QUERY = new URLSearchParams(window.location.search).get("backend") === "off";
 const BACKEND_EXTRACTABLE_EXTENSIONS = new Set([".pdf"]);
@@ -501,7 +503,7 @@ function syncPendingFieldInputs() {
   return changed;
 }
 
-async function commitPendingField(pendingFieldId, rawValue) {
+function commitPendingField(pendingFieldId, rawValue) {
   const nextName = normalizeWhitespace(rawValue);
   if (!nextName) {
     return false;
@@ -516,8 +518,8 @@ async function commitPendingField(pendingFieldId, rawValue) {
   state.focusPendingFieldId = "";
   state.fields.push(ensureUniqueFieldName(nextName));
   applyFieldsToRecords();
+  markProcessingNeeded();
   render();
-  await refreshAutoExtraction(state.files, { reReadContent: false });
   return true;
 }
 
@@ -860,7 +862,12 @@ function updateSummary() {
   fileSummary.textContent = `共 ${state.files.length} 个文件`;
 }
 
+function markProcessingNeeded() {
+  state.needsProcessing = Boolean(state.files.length);
+}
+
 function renderDataViews() {
+  renderFieldList();
   renderTemplateHint();
   renderSelectedFiles();
   renderTable();
@@ -879,27 +886,29 @@ function renderFieldList() {
     input.className = "field-input";
     input.dataset.fieldIndex = String(index);
     input.value = field;
+    input.disabled = state.isExtracting;
     input.setAttribute("aria-label", `字段 ${index + 1}`);
-    input.addEventListener("change", async () => {
+    input.addEventListener("change", () => {
       if (!syncPendingFieldInputs()) {
         return;
       }
+      markProcessingNeeded();
       renderDataViews();
-      await refreshAutoExtraction(state.files, { reReadContent: false });
     });
 
     const insertBtn = document.createElement("button");
     insertBtn.type = "button";
     insertBtn.className = "mini-btn";
     insertBtn.textContent = "插入模板";
+    insertBtn.disabled = state.isExtracting;
     insertBtn.addEventListener("click", () => insertToken(normalizeWhitespace(input.value) || field));
 
     const removeBtn = document.createElement("button");
     removeBtn.type = "button";
     removeBtn.className = "mini-btn";
     removeBtn.textContent = "删除";
-    removeBtn.disabled = state.fields.length === 1;
-    removeBtn.addEventListener("click", async () => {
+    removeBtn.disabled = state.fields.length === 1 || state.isExtracting;
+    removeBtn.addEventListener("click", () => {
       const removed = state.fields[index];
       state.fields.splice(index, 1);
       state.files.forEach((record) => {
@@ -907,8 +916,8 @@ function renderFieldList() {
         delete record.autoValues[removed];
       });
       applyFieldsToRecords();
+      markProcessingNeeded();
       render();
-      await refreshAutoExtraction(state.files, { reReadContent: false });
     });
 
     const actionRow = document.createElement("div");
@@ -927,6 +936,7 @@ function renderFieldList() {
     input.className = "field-input";
     input.dataset.pendingFieldId = draft.id;
     input.value = draft.value;
+    input.disabled = state.isExtracting;
     input.placeholder = "输入字段名";
     input.setAttribute("aria-label", `新增字段 ${index + 1}`);
 
@@ -934,40 +944,41 @@ function renderFieldList() {
     saveBtn.type = "button";
     saveBtn.className = "mini-btn";
     saveBtn.textContent = "添加";
-    saveBtn.disabled = !normalizeWhitespace(draft.value);
+    saveBtn.disabled = state.isExtracting || !normalizeWhitespace(draft.value);
 
-    const commitDraft = async () => {
+    const commitDraft = () => {
       if (!normalizeWhitespace(input.value)) {
         return;
       }
       saveBtn.disabled = true;
-      await commitPendingField(draft.id, input.value);
+      commitPendingField(draft.id, input.value);
     };
 
     input.addEventListener("input", () => {
       draft.value = input.value;
-      saveBtn.disabled = !normalizeWhitespace(input.value);
+      saveBtn.disabled = state.isExtracting || !normalizeWhitespace(input.value);
     });
     input.addEventListener("change", () => {
       if (normalizeWhitespace(input.value)) {
-        void commitDraft();
+        commitDraft();
       }
     });
     input.addEventListener("keydown", (event) => {
       if (event.key === "Enter" && !saveBtn.disabled) {
         event.preventDefault();
-        void commitDraft();
+        commitDraft();
       }
     });
 
     saveBtn.addEventListener("click", () => {
-      void commitDraft();
+      commitDraft();
     });
 
     const removeBtn = document.createElement("button");
     removeBtn.type = "button";
     removeBtn.className = "mini-btn";
     removeBtn.textContent = "删除";
+    removeBtn.disabled = state.isExtracting;
     removeBtn.addEventListener("click", () => {
       state.pendingFields = state.pendingFields.filter((field) => field.id !== draft.id);
       if (state.focusPendingFieldId === draft.id) {
@@ -1154,6 +1165,11 @@ function buildExtractionMessage(record) {
   if (record.contentState === "unsupported") {
     return record.contentMessage || "当前文件类型暂不支持自动读取";
   }
+  if (state.needsProcessing) {
+    return state.hasProcessedFiles
+      ? "文件或字段已更新，等待重新批量替换名称"
+      : "等待点击“批量替换名称”开始读取";
+  }
   if (record.contentState === "error") {
     return record.contentMessage || "读取文件内容失败";
   }
@@ -1170,7 +1186,7 @@ function buildExtractionMessage(record) {
     const modePrefix = profileLabel ? `${profileLabel}，` : "";
     return `内容已读取，${modePrefix}自动匹配到 ${filledCount}/${state.fields.length} 个字段`;
   }
-  return "等待读取文件内容";
+  return state.hasProcessedFiles ? "等待下一次批量替换名称" : "等待点击“批量替换名称”开始读取";
 }
 
 function renderSelectedFiles() {
@@ -1213,7 +1229,8 @@ function renderTable() {
 
   tableHeadRow.innerHTML = "";
 
-  const baseHeaders = ["原文件", ...state.fields];
+  const previewRows = buildPreviewRows();
+  const baseHeaders = ["原文件", ...state.fields, "预览名称"];
   baseHeaders.forEach((text) => {
     const th = document.createElement("th");
     th.textContent = text;
@@ -1221,7 +1238,7 @@ function renderTable() {
   });
 
   tableBody.innerHTML = "";
-  state.files.forEach((row) => {
+  previewRows.forEach((row) => {
     const tr = document.createElement("tr");
 
     const fileCell = document.createElement("td");
@@ -1242,9 +1259,29 @@ function renderTable() {
       input.addEventListener("input", () => {
         row.values[field] = input.value;
       });
+      input.addEventListener("change", () => {
+        renderDataViews();
+      });
       td.append(input);
       tr.append(td);
     });
+
+    const previewCell = document.createElement("td");
+    previewCell.className = "preview-cell";
+    previewCell.innerHTML = `
+      <div class="preview-card">
+        <strong class="preview-name">${escapeHtml(row.previewName)}</strong>
+        <span class="preview-help">${escapeHtml(
+          state.needsProcessing
+            ? "点击“批量替换名称”后会刷新这里的结果"
+            : row.duplicated
+              ? "检测到重名，导出时会自动补序号"
+              : "导出 ZIP 时会按这个名称生成文件"
+        )}</span>
+        ${row.duplicated ? '<span class="duplicate-badge">已自动处理重名</span>' : ""}
+      </div>
+    `;
+    tr.append(previewCell);
 
     tableBody.append(tr);
   });
@@ -1253,7 +1290,15 @@ function renderTable() {
 function updateStatus() {
   const tokens = getTemplateTokens(state.template);
   const missing = getMissingTokens(state.template);
-  reloadExtractBtn.disabled = !state.files.length || state.isExtracting;
+  const canProcessTemplate = Boolean(tokens.length) && !missing.length;
+
+  fileInput.disabled = state.isExtracting;
+  templateInput.disabled = state.isExtracting;
+  addFieldBtn.disabled = state.isExtracting;
+  clearFilesBtn.disabled = !state.files.length || state.isExtracting;
+  processFilesBtn.disabled = !state.files.length || state.isExtracting || !canProcessTemplate;
+  processFilesBtn.textContent = state.hasProcessedFiles && state.needsProcessing ? "重新批量替换名称" : "批量替换名称";
+  dropzone.classList.toggle("is-disabled", state.isExtracting);
   clearValuesBtn.disabled = !state.files.length || state.isExtracting;
   if (exportDiagnosticsBtn) {
     exportDiagnosticsBtn.disabled = !state.files.length || state.isExtracting;
@@ -1280,6 +1325,17 @@ function updateStatus() {
   if (missing.length) {
     setStatus(`模板中存在未定义字段：${missing.join("、")}`, "warn");
     exportZipBtn.disabled = true;
+    return;
+  }
+
+  if (state.needsProcessing) {
+    exportZipBtn.disabled = true;
+    setStatus(
+      state.hasProcessedFiles
+        ? "文件或字段已更新，请点击“重新批量替换名称”刷新结果"
+        : "请点击“批量替换名称”开始读取文字并生成结果",
+      "warn",
+    );
     return;
   }
 
@@ -1317,7 +1373,6 @@ function updateStatus() {
 }
 
 function render() {
-  renderFieldList();
   renderDataViews();
 }
 
@@ -1345,7 +1400,7 @@ function makeRecord(file) {
     baseContentText: "",
     ocrContentText: "",
     contentState: "idle",
-    contentMessage: "等待读取文件内容",
+    contentMessage: "等待点击“批量替换名称”开始读取",
     contentTypeLabel: "",
     ocrAttempted: false,
     ocrAttemptedFieldSetKeys: [],
@@ -1363,7 +1418,7 @@ function resetRecordExtractionArtifacts(record) {
   record.ocrContentText = "";
   record.contentTypeLabel = "";
   record.contentState = "idle";
-  record.contentMessage = "等待读取文件内容";
+  record.contentMessage = "等待点击“批量替换名称”开始读取";
   record.ocrAttempted = false;
   record.ocrAttemptedFieldSetKeys = [];
   record.documentProfile = "";
@@ -1457,12 +1512,14 @@ function addFiles(fileList) {
     return;
   }
   state.files.push(...incoming);
+  markProcessingNeeded();
   render();
-  refreshAutoExtraction(incoming, { reReadContent: true });
 }
 
 function clearFiles() {
   state.files = [];
+  state.needsProcessing = false;
+  state.hasProcessedFiles = false;
   fileInput.value = "";
   render();
 }
@@ -1484,10 +1541,12 @@ function clearFieldValues() {
 async function exportZip() {
   const fieldsChanged = syncPendingFieldInputs();
   if (fieldsChanged) {
+    markProcessingNeeded();
     renderDataViews();
   }
-  if (state.files.length && fieldsChanged) {
-    await refreshAutoExtraction(state.files, { reReadContent: false });
+  if (state.needsProcessing) {
+    setStatus("请先点击“批量替换名称”完成读取，再下载 ZIP", "warn");
+    return;
   }
   const previewRows = buildPreviewRows();
   exportZipBtn.disabled = true;
@@ -1512,6 +1571,39 @@ async function exportZip() {
     exportZipBtn.disabled = false;
     setStatus("批量重命名失败，请重试", "warn");
   }
+}
+
+async function processBatchRename() {
+  const fieldsChanged = syncPendingFieldInputs();
+  if (fieldsChanged) {
+    markProcessingNeeded();
+    render();
+  } else {
+    renderDataViews();
+  }
+
+  if (!state.files.length) {
+    setStatus("请先选择至少一个文件", "warn");
+    return;
+  }
+
+  if (state.isExtracting) {
+    setStatus("当前已经在读取文件内容，请稍候", "warn");
+    return;
+  }
+
+  const tokens = getTemplateTokens(state.template);
+  const missing = getMissingTokens(state.template);
+  if (!tokens.length) {
+    setStatus("模板里还没有有效字段占位符，请先完善模板", "warn");
+    return;
+  }
+  if (missing.length) {
+    setStatus(`模板中存在未定义字段：${missing.join("、")}`, "warn");
+    return;
+  }
+
+  await refreshAutoExtraction(state.files, { reReadContent: false });
 }
 
 function buildManifestRows(previewRows = buildPreviewRows()) {
@@ -4494,6 +4586,8 @@ async function runAutoExtraction(records = state.files, options = {}) {
   }
 
   state.isExtracting = false;
+  state.needsProcessing = false;
+  state.hasProcessedFiles = true;
   renderDataViews();
 }
 
@@ -4530,6 +4624,7 @@ function refreshAutoExtraction(records = state.files, options = {}) {
 
 fileInput.addEventListener("change", (event) => {
   addFiles(event.target.files);
+  event.target.value = "";
 });
 
 ["dragenter", "dragover"].forEach((eventName) => {
@@ -4555,7 +4650,7 @@ templateInput.addEventListener("input", () => {
   render();
 });
 
-addFieldBtn.addEventListener("click", async () => {
+addFieldBtn.addEventListener("click", () => {
   const pendingFieldId = createLocalId();
   state.pendingFields.push({ id: pendingFieldId, value: "" });
   state.focusPendingFieldId = pendingFieldId;
@@ -4563,7 +4658,9 @@ addFieldBtn.addEventListener("click", async () => {
 });
 
 clearFilesBtn.addEventListener("click", clearFiles);
-reloadExtractBtn.addEventListener("click", () => refreshAutoExtraction(state.files, { reReadContent: true }));
+processFilesBtn.addEventListener("click", () => {
+  void processBatchRename();
+});
 clearValuesBtn.addEventListener("click", clearFieldValues);
 resetTemplateBtn.addEventListener("click", () => {
   state.template = "{姓名}-{编号}";

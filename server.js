@@ -12,7 +12,7 @@ const port = Number(process.env.PORT || 8123);
 const rootDir = __dirname;
 const baseDir = path.resolve(rootDir);
 const tempRootDir = path.join(baseDir, '.tmp');
-const APP_VERSION = '20260612-phase01opt1';
+const APP_VERSION = '20260612-manualflow1';
 const maxUploadFiles = Number(process.env.MAX_UPLOAD_FILES || 200);
 const maxUploadFileSize = Number(process.env.MAX_UPLOAD_FILE_SIZE || 50 * 1024 * 1024);
 
@@ -231,6 +231,8 @@ async function resetWorkerPage(page, fields, requestOptions = {}) {
     state.status = '服务端工作页初始化完成';
     state.statusKind = '';
     state.isExtracting = false;
+    state.needsProcessing = false;
+    state.hasProcessedFiles = false;
     state.extractionRunId = 0;
     state.activeExtractionPromise = null;
     state.pendingExtractionRequest = null;
@@ -327,9 +329,17 @@ async function extractFilesWithBrowser(options) {
       }, files.map((file) => file.originalname || ''));
       await input.uploadFile(...files.map((file) => file.path));
       await page.waitForFunction((expectedCount) => state.files.length === expectedCount, {}, files.length);
+      await page.waitForFunction(() => {
+        const action = document.querySelector('#processFilesBtn');
+        return Boolean(action && !action.disabled);
+      }, { timeout: timeoutMs });
+      await page.evaluate(async () => {
+        await processBatchRename();
+      });
       await page.waitForFunction((expectedCount) => (
         state.files.length === expectedCount
         && !state.isExtracting
+          && !state.needsProcessing
           && !state.activeExtractionPromise
           && state.files.every((record) => record.contentState !== 'reading')
         ), { timeout: timeoutMs }, files.length);
